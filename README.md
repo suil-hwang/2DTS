@@ -44,6 +44,16 @@ Furthermore, our approach produces reconstructed meshes with superior visual qua
 4. Install dependencies: `pip install -r requirements.txt --no-cache-dir`;
 5. Execute `pip install . --no-cache-dir` in the project root directory;
 
+### Install with AI
+
+If you use an AI coding agent in your editor or terminal, you can ask it to install this repository for you. Make sure CUDA 12.4 or higher is already installed and that `CUDA_HOME` is set correctly.
+
+From the project root, give the agent a prompt like this:
+
+```text
+Install this 2DTS repository for local development. Create a Python 3.12 environment, install requirements.txt, run pip install . in the repo root, and fix any setup issues you encounter.
+```
+
 
 ## - Usage
 ### Training
