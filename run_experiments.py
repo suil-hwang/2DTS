@@ -2,7 +2,7 @@ import os
 import argparse
 import torch
 
-from src.diff_recon import VanillaTSTrainer, loadConfig, run_exp_with_args
+from src.diff_recon import TSTrainer, loadConfig, run_exp_with_args
 from scripts.eval_dtu import cull_and_eval
 from scripts.eval_nerf_synthetic import eval_nerf_synthetic
 
@@ -27,7 +27,7 @@ def exp(
     if point_count_prune is not None and config.model.model_update.contribution_pruning is not None:
         config.model.model_update.contribution_pruning.target_point_num = point_count_prune
 
-    trainer = VanillaTSTrainer(config, exp_name=scene_id, device=device)
+    trainer = TSTrainer(config, exp_name=scene_id, device=device)
     trainer.train()
 
     if eval_cd:

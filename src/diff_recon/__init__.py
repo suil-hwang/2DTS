@@ -1,16 +1,12 @@
-from .trainers.VanillaGS_trainer import VanillaGSTrainer
-from .trainers.VanillaTS_trainer import VanillaTSTrainer
+from .trainers.TS_trainer import TSTrainer
 
 from .datasets.Colmap_dataset import ColmapDatasetFactory, BaseDatasetFactory
 from .datasets.NerfSynthetic_dataset import NerfSyntheticDatasetFactory
 from .datasets.MatrixCity_dataset import MatrixCityDatasetFactory
 
-from .models.VanillaGS_model import VanillaGSModel
-from .models.VanillaTS_model import VanillaTSModel
-from .models.HybridGT_model import HybridGTModel
+from .models.TS_model import TSModel
 from .models.animated_triangle import AnimatedTriangle
 
-from .models.raw_gaussian import RawGaussian
 from .models.raw_triangle import RawTriangle
 
 from .utils.config import loadConfig, Config

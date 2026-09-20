@@ -1,7 +1,8 @@
 import numpy as np
 from plyfile import PlyData, PlyElement
 from pathlib import Path
-# import open3d as o3d
+
+from ..utils.sh_utils import SH2RGB
 
 class PointCloud:
     def __init__(self, points: np.array = None, colors: np.array = None, normals: np.array = None):
@@ -13,22 +14,23 @@ class PointCloud:
             self.normals = np.zeros_like(points)
 
     def fetchPly(self, ply_path):
+        """Read point positions, RGB or SH DC colors, and optional normals."""
         plydata = PlyData.read(ply_path)
         vertices = plydata["vertex"]
+        properties = vertices.data.dtype.names
         positions = np.vstack([vertices["x"], vertices["y"], vertices["z"]]).T
-        try:
+        if all(f"f_dc_{i}" in properties for i in range(3)):
+            # Only point colors are needed for triangle initialization.
+            sh_dc = np.vstack([vertices[f"f_dc_{i}"] for i in range(3)]).T.astype(np.float32)
+            colors = SH2RGB(sh_dc)
+        elif all(name in properties for name in ("red", "green", "blue")):
             colors = np.vstack([vertices["red"], vertices["green"], vertices["blue"]]).T / 255.0
-        except:
+        else:
             colors = np.random.rand(positions.shape[0], positions.shape[1])
-        try:
+        if all(name in properties for name in ("nx", "ny", "nz")):
             normals = np.vstack([vertices["nx"], vertices["ny"], vertices["nz"]]).T
-        except:
+        else:
             normals = np.zeros_like(positions)
-            # pcd = o3d.geometry.PointCloud()
-            # positions = np.asarray(positions, dtype=np.float64)
-            # pcd.points = o3d.utility.Vector3dVector(positions)
-            # pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-            # normals = np.array(pcd.normals)
 
         self.points = positions
         self.colors = colors

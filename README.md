@@ -16,7 +16,8 @@ Official implementation of [2DTS][1] (2D Triangle Splatting for Direct Different
 
 We provide a complete training pipeline for 2DTS, a differentiable 3D Geometric Representation adapted from [3DGS][2] (3D Gaussian Splatting) that replace the Gaussians primitives with triangle primitives, while retaining the full differentiability of the model.
 The proposed method is capable of producing triangle meshes with high visual fidelity through an end-to-end training pipeline.
-The repository also includes a hybrid rasterizer that can render triangle splats and Gaussian splats together in a single unified renderer.
+
+This checkout contains the 2DTS pipeline only. Standalone 3DGS and hybrid Gaussian/triangle rendering have been removed. The two native dependencies are `simple-knn` and `diff-triangle-rasterization`; point-cloud initialization accepts RGB or SH DC colors from PLY files. Triangle mesh and GLB/glTF utilities remain available.
 
 ![demo_image](./assets/demo_image.png)
 
@@ -37,21 +38,22 @@ Furthermore, our approach produces reconstructed meshes with superior visual qua
 
 ## - Installation
 
-1. Install CUDA 12.4 or higher (remember to set the environment variable `CUDA_HOME` to the CUDA installation path);
-2. Clone the repository: `git clone https://github.com/GaodeRender/triangle-splatting.git; cd triangle-splatting`;
-3. Create new conda environment with Python 3.12: `conda create -n 2dts python=3.12`;
-   Activate the environment: `conda activate 2dts`;
-4. Install dependencies: `pip install -r requirements.txt --no-cache-dir`;
-5. Execute `pip install . --no-cache-dir` in the project root directory;
+For this checkout's Python 3.12 / CUDA 13.0 environment, use [`environment.yml`](./environment.yml) and the steps below.
+
+1. Prepare CUDA Toolkit 13.0 and the host C++ compiler, and set `CUDA_HOME` to the toolkit path. On Windows, use an x64 Visual Studio developer shell.
+2. From this checkout's root, create the environment: `conda env create -f environment.yml`.
+3. Activate it: `conda activate 2DTS`.
+4. Build the native dependencies: `python -m pip install --no-build-isolation --no-deps ./submodules/simple-knn ./submodules/diff-triangle-rasterization`.
+5. Install the project: `python -m pip install --no-build-isolation --no-deps -e .`.
 
 ### Install with AI
 
-If you use an AI coding agent in your editor or terminal, you can ask it to install this repository for you. Make sure CUDA 12.4 or higher is already installed and that `CUDA_HOME` is set correctly.
+If you use an AI coding agent in your editor or terminal, you can ask it to install this repository for you. Make sure CUDA Toolkit 13.0 is already installed and that `CUDA_HOME` is set correctly.
 
 From the project root, give the agent a prompt like this:
 
 ```text
-Install this 2DTS repository for local development. Create a Python 3.12 environment, install requirements.txt, run pip install . in the repo root, and fix any setup issues you encounter.
+Install this 2DTS repository for local development using environment.yml. Activate 2DTS, build simple-knn and diff-triangle-rasterization with --no-build-isolation --no-deps, then install the root package with the same flags and -e . Verify the CUDA toolkit, host compiler, extension imports, and a small CUDA forward/backward run.
 ```
 
 
@@ -77,6 +79,7 @@ tensorboard --logdir ./outputs
 
 ### Rendering
 We provide an interactive web viewer based on [Viser Viewer][3] for visualizing the trained triangle splats and meshes.
+The legacy viewer requires Viser, which is excluded from `environment.yml`. `py_viewer/` is reserved for the planned ModernGL viewer and does not yet contain an implementation.
 You can run the viewer by executing the following command:
 ```bash
 python viser_viewer.py --config /path/to/config --dataset /path/to/dataset --scene {scene_name}
@@ -87,16 +90,6 @@ python viser_viewer.py --config config/NerfSynthetic_VanillaTS_mesh.yaml --datas
 ```
 
 Then, open your web browser and navigate to `http://localhost:8080` to view the rendered scene. If you are running the viewer on a remote server, make sure to set up port forwarding or access the server's IP address directly.
-
-### Hybrid Rendering
-We also provide a hybrid viewer built on top of the unified hybrid rasterizer in `submodules/hybrid-rasterization/`. It renders Gaussian splats from a `.ply` checkpoint together with triangle content loaded from a `.glb` or `.gltf` asset.
-
-You can launch it with:
-```bash
-python hybrid_viewer.py --ply /path/to/gaussians.ply --glb /path/to/triangles.glb --device 0
-```
-
-The optional `--output` argument controls where viewer snapshots are stored. This viewer is useful for inspecting hybrid scenes that combine a Gaussian reconstruction with triangle-based geometry or animated glTF assets.
 
 ## - Notes
 We provided two distinct training configurations: VanillaTS and VanillaTS_mesh.
@@ -112,7 +105,6 @@ The difference between a diffuse and a solid triangle is visualized in the follo
 This repository contains code under **two different licenses**:
 
 - 🟥 **Gaussian Splatting Research License** — applies to components derived from the original [Gaussian Splatting][2] project:
-  - `submodules/custom-gaussian-rasterization/`
   - `submodules/simple-knn/`
   - These components are licensed for **non-commercial research use only**.
   - See [LICENSE.gausplat.md](./LICENSE.gausplat.md)
@@ -120,7 +112,6 @@ This repository contains code under **two different licenses**:
 - 🟩 **MIT License** — applies to other parts of the repository, including:
   - `src/diff_recon/`
   - `submodules/diff-triangle-rasterization/`
-  - `submodules/hybrid-rasterization/`
   - See [LICENSE](./LICENSE)
 
 Please make sure to comply with both licenses when using this repository.

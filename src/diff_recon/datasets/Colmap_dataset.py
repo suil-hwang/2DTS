@@ -8,12 +8,10 @@ from .colmap_loader import read_points3D_binary, CameraInfo, readColmapCameras
 from .Base_dataset import BaseDatasetFactory
 from .dataset_utils import getCameraExtent
 from ..models.point_cloud import PointCloud
-from ..models.raw_gaussian import RawGaussian
 from ..utils.config import Config
 from ..utils.logger import Logger
 from ..utils.file_handler import LocalHandler, BaseFileHandler
 from ..utils.camera import Camera, getWorld2ViewMatrix
-from ..utils.sh_utils import SH2RGB
 
 
 def solve_target_res(target_res: int | list[int] | None, orig_w: int, orig_h: int) -> tuple[int, int]:
@@ -248,14 +246,7 @@ class ColmapDatasetFactory(BaseDatasetFactory):
             xyz, rgb, _ = read_points3D_binary(pcd_path)
             pcd = PointCloud(xyz, rgb)
         elif pcd_path.endswith(".ply"):
-            try:
-                raw_gs = RawGaussian(ply_path=pcd_path)
-                pcd = PointCloud()
-                pcd.points = raw_gs.xyz
-                pcd.colors = SH2RGB(raw_gs.shs[:, :3])
-                pcd.normals = raw_gs.normals
-            except Exception as e:
-                pcd = PointCloud().fetchPly(pcd_path)
+            pcd = PointCloud().fetchPly(pcd_path)
         else:
             raise ValueError(f"Unsupported point cloud file format: {pcd_path.split('.')[-1]}")
 

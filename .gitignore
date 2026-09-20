@@ -6,3 +6,5 @@ outputs/
 **.egg-info/
 build/
 scripts/eval_dtu/__pycache__
+paper/
+docs/

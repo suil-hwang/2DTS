@@ -1,0 +1,33 @@
+name: 2DTS
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - pip
+  - setuptools
+  - wheel
+  - packaging
+  - ninja
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu130
+      - torch==2.14.0+cu130
+      - torchvision==0.29.0+cu130
+      - numpy
+      - opencv-python
+      - scipy
+      - scikit-image
+      - scikit-learn
+      - matplotlib
+      - cycler
+      - Pillow
+      - plyfile
+      - PyYAML
+      - Shapely
+      - tqdm
+      - trimesh
+      - libigl
+      - open3d
+      - torchmetrics
+      - tensorboard
+      - oss2

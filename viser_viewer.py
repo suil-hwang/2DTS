@@ -11,7 +11,7 @@ import argparse
 import cv2
 from scipy.spatial.transform import Rotation as Rot
 
-from src.diff_recon import loadConfig, VanillaTSModel, VanillaGSModel, BaseDatasetFactory, VanillaTSTrainer
+from src.diff_recon import loadConfig, TSModel, BaseDatasetFactory, TSTrainer
 from src.diff_recon.utils.camera import Camera, rotmat2qvec, qvec2rotmat
 from src.diff_recon.utils.vis_utils import depth_to_image, normal_to_image, alpha_to_image
 
@@ -229,7 +229,7 @@ class VisClient:
             self._update = False
             return
 
-        model: VanillaTSModel | VanillaGSModel = self._model_dict[self._model_dropdown.value]
+        model: TSModel = self._model_dict[self._model_dropdown.value]
         camera = self._get_camera().to(model.device)
 
         back_culling = self._back_culling_ckbx.value
@@ -367,24 +367,18 @@ def run_VisViewer(config_path: str, dataset_path: str, scene_id: str):
     config.dataset.train_target_res = 1
     config.dataset.test_target_res = 1
     config.dataset.background = config.dataset.test_background
-    trainer = VanillaTSTrainer(config, exp_name=scene_id, log_file=False)
+    trainer = TSTrainer(config, exp_name=scene_id, log_file=False)
 
     ply_files = os.listdir(os.path.join(trainer.output_dir, "point_cloud")) if os.path.exists(os.path.join(trainer.output_dir, "point_cloud")) else []
     glb_files = os.listdir(os.path.join(trainer.output_dir, "glb")) if os.path.exists(os.path.join(trainer.output_dir, "glb")) else []
-    gs_files = (
-        os.listdir(os.path.join(trainer.output_dir, "gs_point_cloud")) if os.path.exists(os.path.join(trainer.output_dir, "gs_point_cloud")) else []
-    )
 
     model_dict = {}
     for ply_file in ply_files:
         name = ply_file.split(".")[0]
-        model_dict[name] = VanillaTSModel(config.model).loadPLY(os.path.join(trainer.output_dir, "point_cloud", ply_file))
+        model_dict[name] = TSModel(config.model).loadPLY(os.path.join(trainer.output_dir, "point_cloud", ply_file))
     for glb_file in glb_files:
         name = glb_file.split(".")[0]
         model_dict[f"{name}_mesh"] = load_mesh(os.path.join(trainer.output_dir, "glb", glb_file))
-    for gs_file in gs_files:
-        name = gs_file.split(".")[0]
-        model_dict[f"{name}_gs"] = VanillaGSModel(config.model).loadPLY(os.path.join(trainer.output_dir, "gs_point_cloud", gs_file))
 
     viewer = VisViewer(trainer.dataset, model_dict)
     viewer.run()
