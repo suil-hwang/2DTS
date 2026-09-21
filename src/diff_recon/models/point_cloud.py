@@ -68,4 +68,7 @@ class PointCloud:
         return self
     
     def __getitem__(self, idx):
+        if isinstance(idx, (int, np.integer)):
+            idx = range(len(self))[idx]
+            idx = slice(idx, idx + 1)
         return PointCloud(self.points[idx], self.colors[idx], self.normals[idx])

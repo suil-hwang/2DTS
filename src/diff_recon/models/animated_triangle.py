@@ -1,8 +1,10 @@
 import math
-from copy import deepcopy
+from copy import copy as shallow_copy, deepcopy
 from pathlib import Path
 
+import igl
 import numpy as np
+from trimesh.transformations import rotation_matrix
 
 from .raw_triangle import RawTriangle
 from ..utils.gltf_utils import build_texture_atlas, ensure_rgba, load_glb_chunks, load_image_from_gltf, read_accessor
@@ -26,6 +28,7 @@ class AnimatedTriangle:
         self._bin_chunk: bytes = b""
         self._scene_index: int = 0
         self._scene_roots: list[int] = []
+        self._scene_nodes: set[int] = set()
         self._nodes: list[dict] = []
         self._meshes: list[dict] = []
         self._skins: list[dict] = []
@@ -72,6 +75,8 @@ class AnimatedTriangle:
 
         triangle = deepcopy(self._rest_triangle) if copy else self._rest_triangle
         if apply_object_transform and len(triangle) > 0:
+            if not copy:
+                triangle = shallow_copy(triangle)
             vertex_shape = triangle.vertex.shape
             triangle.vertex = np.ascontiguousarray(
                 self._transform_points(self._object_transform, triangle.vertex.reshape(-1, 3)).reshape(vertex_shape)
@@ -127,13 +132,25 @@ class AnimatedTriangle:
         if not glb_path.exists():
             raise FileNotFoundError(f"GLB file not found: {path}")
 
+        if self._gltf is not None:
+            self.active_animation_index = 0
         self.glb_path = str(glb_path)
         self._object_transform = np.eye(4, dtype=np.float32)
         self._gltf, self._bin_chunk = load_glb_chunks(glb_path)
         self._scene_index = self._gltf.get("scene", 0)
-        self._scene_roots = list(self._gltf.get("scenes", [{}])[self._scene_index].get("nodes", []))
-
         self._nodes = self._parse_nodes()
+        scenes = self._gltf.get("scenes", [])
+        if scenes:
+            self._scene_roots = list(scenes[self._scene_index].get("nodes", []))
+        else:
+            child_nodes = {child for node in self._nodes for child in node["children"]}
+            self._scene_roots = [idx for idx in range(len(self._nodes)) if idx not in child_nodes]
+        self._scene_nodes = set()
+        pending = self._scene_roots.copy()
+        while pending:
+            node_idx = pending.pop()
+            self._scene_nodes.add(node_idx)
+            pending.extend(self._nodes[node_idx]["children"])
         self._textures = self._parse_textures(glb_path)
         self._materials = self._parse_materials()
         self._build_material_texture_atlas()
@@ -171,7 +188,7 @@ class AnimatedTriangle:
 
         for node_idx, node in enumerate(self._nodes):
             mesh_index = node["mesh"]
-            if mesh_index is None:
+            if mesh_index is None or node_idx not in self._scene_nodes:
                 continue
 
             mesh = self._meshes[mesh_index]
@@ -194,7 +211,7 @@ class AnimatedTriangle:
                 tri_rgb = np.clip(tri_rgba[..., :3], 0.0, 1.0)
 
                 tri_vertex_list.append(tri_vertex.astype(np.float32))
-                tri_opacity_list.append(self._alpha_to_logit(tri_alpha))
+                tri_opacity_list.append(RawTriangle._alpha_to_logit(tri_alpha))
                 tri_sh_list.append(RGB2SH(tri_rgb.astype(np.float32)).astype(np.float32))
                 if use_texture:
                     tri_uv = self._get_atlas_uv(primitive)
@@ -434,7 +451,9 @@ class AnimatedTriangle:
                 values = read_accessor(self._gltf, self._bin_chunk, sampler["output"]).astype(np.float32)
                 interpolation = sampler.get("interpolation", "LINEAR")
                 if interpolation == "CUBICSPLINE":
-                    values = values.reshape(len(times), 3, *values.shape[1:])
+                    values = values.reshape(len(times), 3, -1)
+                else:
+                    values = values.reshape(len(times), -1)
 
                 tracks.append(
                     {
@@ -491,22 +510,16 @@ class AnimatedTriangle:
         return self._compose_trs(state["translation"], state["rotation"], state["scale"])
 
     def _compute_world_matrices(self, local_matrices: list[np.ndarray]) -> np.ndarray:
-        world_matrices = [np.eye(4, dtype=np.float32) for _ in local_matrices]
+        world_matrices = np.repeat(np.eye(4, dtype=np.float32)[None], len(local_matrices), axis=0)
 
         def visit(node_idx: int, parent_matrix: np.ndarray):
             world_matrices[node_idx] = parent_matrix @ local_matrices[node_idx]
             for child_idx in self._nodes[node_idx]["children"]:
                 visit(child_idx, world_matrices[node_idx])
 
-        if self._scene_roots:
-            for root_idx in self._scene_roots:
-                visit(root_idx, np.eye(4, dtype=np.float32))
-        else:
-            child_nodes = {child for node in self._nodes for child in node["children"]}
-            roots = [idx for idx in range(len(self._nodes)) if idx not in child_nodes]
-            for root_idx in roots:
-                visit(root_idx, np.eye(4, dtype=np.float32))
-        return np.stack(world_matrices, axis=0)
+        for root_idx in self._scene_roots:
+            visit(root_idx, np.eye(4, dtype=np.float32))
+        return world_matrices
 
     def _apply_morph_targets(self, primitive: dict, mesh: dict, node_weights: np.ndarray | None) -> np.ndarray:
         positions = primitive["positions"].copy()
@@ -533,21 +546,33 @@ class AnimatedTriangle:
         skin = self._skins[node["skin"]]
         joint_matrices = world_matrices[skin["joints"]] @ skin["inverse_bind"]
 
-        positions_h = np.concatenate([positions.astype(np.float32), np.ones((len(positions), 1), dtype=np.float32)], axis=1)
         joints = primitive["joints"].astype(np.int32)
         weights = primitive["weights"].astype(np.float32)
+        weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1e-8)
 
-        total_weight = weights.sum(axis=1, keepdims=True)
-        weights = np.divide(weights, np.maximum(total_weight, 1e-8), out=np.zeros_like(weights), where=total_weight > 0)
+        if "skinning_matrix" not in primitive:
+            primitive["skinning_matrix"] = None
+            joint_count = int(joints.max(initial=-1)) + 1
+            matrix_bytes = len(positions) * joint_count * 4 * 8
+            # Cache fixed rest geometry only; limit the dense operator to 16 joints and 8 MiB per primitive.
+            if not primitive["morph_positions"] and 0 < joint_count <= 16 and matrix_bytes <= 8 * 1024**2:
+                dense_weights = np.zeros((len(positions), joint_count), dtype=np.float64)
+                np.add.at(dense_weights, (np.arange(len(positions))[:, None], joints), weights)
+                primitive["skinning_matrix"] = igl.lbs_matrix(primitive["positions"].astype(np.float64), dense_weights)
 
-        skinned = np.zeros((len(positions), 4), dtype=np.float32)
-        for influence_idx in range(joints.shape[1]):
-            influence_weight = weights[:, influence_idx : influence_idx + 1]
+        matrix = primitive["skinning_matrix"]
+        if matrix is not None:
+            joint_count = matrix.shape[1] // 4
+            transforms = joint_matrices[:joint_count, :3, :].transpose(0, 2, 1).reshape(-1, 3)
+            return (matrix @ transforms.astype(np.float64)).astype(np.float32)
+
+        positions_h = np.concatenate([positions.astype(np.float32), np.ones((len(positions), 1), dtype=np.float32)], axis=1)
+        skinned = np.zeros_like(positions_h)
+        for joint_indices, influence_weight in zip(joints.T, weights.T):
             if not np.any(influence_weight > 0):
                 continue
-            influence_joint = joints[:, influence_idx]
-            influence_mats = joint_matrices[influence_joint]
-            skinned += influence_weight * np.einsum("nij,nj->ni", influence_mats, positions_h)
+            transformed = np.einsum("nij,nj->ni", joint_matrices[joint_indices], positions_h)
+            skinned += influence_weight[:, None] * transformed
 
         return skinned[:, :3]
 
@@ -576,7 +601,10 @@ class AnimatedTriangle:
     def _can_sample_texture(self) -> bool:
         if self._texture_atlas is None:
             return False
-        for mesh in self._meshes:
+        for node_idx, node in enumerate(self._nodes):
+            if node["mesh"] is None or node_idx not in self._scene_nodes:
+                continue
+            mesh = self._meshes[node["mesh"]]
             for primitive in mesh["primitives"]:
                 if primitive["vertex_rgba"] is not None:
                     return False
@@ -726,17 +754,12 @@ class AnimatedTriangle:
                     tri[1], tri[2] = tri[2], tri[1]
                 if tri[0] != tri[1] and tri[1] != tri[2] and tri[0] != tri[2]:
                     faces.append(tri)
-            return np.asarray(faces, dtype=np.int32)
+            return np.asarray(faces, dtype=np.int32).reshape(-1, 3)
         if mode == 6:
             root = int(indices[0])
             faces = [[root, int(indices[idx]), int(indices[idx + 1])] for idx in range(1, len(indices) - 1)]
-            return np.asarray(faces, dtype=np.int32)
+            return np.asarray(faces, dtype=np.int32).reshape(-1, 3)
         raise ValueError(f"Unsupported glTF primitive mode for triangles: {mode}")
-
-    @staticmethod
-    def _alpha_to_logit(alpha: np.ndarray) -> np.ndarray:
-        alpha = np.clip(alpha, 1e-5, 1.0 - 1e-5)
-        return np.log(alpha / (1.0 - alpha)).astype(np.float32)
 
     @staticmethod
     def _validate_scalar(value: np.ndarray, name: str) -> float:
@@ -763,24 +786,11 @@ class AnimatedTriangle:
             return axis
 
         axis = AnimatedTriangle._validate_vec3(axis, "axis")
-        norm = np.linalg.norm(axis)
+        norm = np.linalg.norm(axis.astype(np.float64))
         if norm < 1e-8:
             raise ValueError("axis must be non-zero")
-        axis = axis / norm
         angle = np.deg2rad(AnimatedTriangle._validate_scalar(degree, "degree"))
-
-        x, y, z = axis.astype(np.float32)
-        cos_theta = float(np.cos(angle))
-        sin_theta = float(np.sin(angle))
-        one_minus_cos = 1.0 - cos_theta
-        return np.array(
-            [
-                [cos_theta + x * x * one_minus_cos, x * y * one_minus_cos - z * sin_theta, x * z * one_minus_cos + y * sin_theta],
-                [y * x * one_minus_cos + z * sin_theta, cos_theta + y * y * one_minus_cos, y * z * one_minus_cos - x * sin_theta],
-                [z * x * one_minus_cos - y * sin_theta, z * y * one_minus_cos + x * sin_theta, cos_theta + z * z * one_minus_cos],
-            ],
-            dtype=np.float32,
-        )
+        return rotation_matrix(angle, axis)[:3, :3].astype(np.float32)
 
     @staticmethod
     def _translation_matrix(offset: np.ndarray) -> np.ndarray:
@@ -792,7 +802,7 @@ class AnimatedTriangle:
     def _compose_trs(translation: np.ndarray, rotation: np.ndarray, scale: np.ndarray) -> np.ndarray:
         rotation_matrix = AnimatedTriangle._quat_to_matrix(rotation)
         matrix = np.eye(4, dtype=np.float32)
-        matrix[:3, :3] = rotation_matrix @ np.diag(scale.astype(np.float32))
+        matrix[:3, :3] = rotation_matrix * scale.astype(np.float32)
         matrix[:3, 3] = translation.astype(np.float32)
         return matrix
 
@@ -839,8 +849,7 @@ class AnimatedTriangle:
 
     @staticmethod
     def _transform_points(matrix: np.ndarray, points: np.ndarray) -> np.ndarray:
-        points_h = np.concatenate([points.astype(np.float32), np.ones((len(points), 1), dtype=np.float32)], axis=1)
-        return (matrix @ points_h.T).T[:, :3].astype(np.float32)
+        return (points.astype(np.float32) @ matrix[:3, :3].T + matrix[:3, 3]).astype(np.float32)
 
     @staticmethod
     def _wrap_uv(coord: np.ndarray, wrap_mode: int) -> np.ndarray:

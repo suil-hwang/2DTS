@@ -17,7 +17,8 @@ namespace Rasterizer
 		const bool back_culling,
 		const bool rich_info,
 		const int sort_level,
-		const bool debug);
+		const bool debug,
+		cudaStream_t stream);
 
 	void backward(
 		const Params::CameraInfo &cameraInfo,
@@ -28,5 +29,6 @@ namespace Rasterizer
 		const bool back_culling,
 		const bool rich_info,
 		const int sort_level,
-		const bool debug);
+		const bool debug,
+		cudaStream_t stream);
 };

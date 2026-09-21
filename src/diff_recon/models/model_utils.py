@@ -28,8 +28,7 @@ def filter_tensor_dict(d: dict[str, torch.Tensor], indices: torch.Tensor):
 def get_first_unique_indices(t: torch.Tensor, dim=0) -> torch.Tensor:
     _, idx, counts = torch.unique(t, dim=dim, sorted=True, return_inverse=True, return_counts=True)
     _, ind_sorted = torch.sort(idx, stable=True)
-    cum_sum = counts.cumsum(0)
-    cum_sum = torch.cat((torch.tensor([0], device=t.device), cum_sum[:-1]))
+    cum_sum = counts.cumsum(0) - counts
     first_indicies = ind_sorted[cum_sum]
     return first_indicies
 
@@ -84,7 +83,7 @@ def build_Rmat(q: torch.Tensor) -> torch.Tensor:
     y = q[:, 2]
     z = q[:, 3]
 
-    R = torch.zeros((q.size(0), 3, 3)).to(q.device)
+    R = q.new_zeros((q.size(0), 3, 3))
     R[:, 0, 0] = 1 - 2 * (y * y + z * z)
     R[:, 0, 1] = 2 * (x * y - r * z)
     R[:, 0, 2] = 2 * (x * z + r * y)
@@ -117,19 +116,21 @@ def grid_sampling(xyz: torch.Tensor, *attrs: torch.Tensor, grid_size: float = 0.
         sampled_xyz = grid_coords_unique.float() * grid_size
         sampled_attrs = []
         for attr in attrs:
-            sampled_attr = torch.zeros((sampled_xyz.shape[0], attr.shape[1])).float().to(attr.device)
-            sampled_attr.scatter_reduce_(0, inverse_indices.unsqueeze(1).expand(-1, attr.shape[1]), attr, "mean")
+            sampled_attr = torch.zeros((sampled_xyz.shape[0], attr.shape[1]), dtype=torch.float32, device=attr.device)
+            sampled_attr.scatter_reduce_(0, inverse_indices.unsqueeze(1).expand(-1, attr.shape[1]), attr, "mean", include_self=False)
             sampled_attrs.append(sampled_attr)
         return sampled_xyz, *sampled_attrs
 
 
 def grid_size_search(xyz: torch.Tensor, n_sample: int, tolerance: float = 0.1, max_retry: int = 10) -> float:
     """
-    Run a binary search to find the grid size that can sample n_sample points
-    (within an error margin) from the input point cloud.
+    Find a grid size whose sampled count is near n_sample, on a best-effort basis.
+    Grid counts are not monotone in grid size, so the target tolerance is not
+    guaranteed. Keep the closest evaluated count, including the unchanged input
+    at grid size zero. With no retries, return zero.
 
     :param xyz: (N, 3)
-    :param n_sample: int
+    :param n_sample: positive target count, or None to keep all points
     :return: float
     """
     if n_sample is None or n_sample >= xyz.shape[0]:
@@ -142,18 +143,24 @@ def grid_size_search(xyz: torch.Tensor, n_sample: int, tolerance: float = 0.1, m
     n_sample_max = n_sample + n_sample_error_tolerance
 
     grid_size = max_grid_size / n_sample ** (1 / 3)
+    best_grid_size = 0.0
+    best_error = xyz.shape[0] - n_sample
 
     for _ in range(max_retry):
         n = grid_sampling(xyz, grid_size=grid_size).shape[0]
+        error = abs(n - n_sample)
+        if error < best_error:
+            best_grid_size = grid_size
+            best_error = error
         if n_sample_min <= n <= n_sample_max:
-            return grid_size
+            return best_grid_size
         elif n < n_sample_min:
             max_grid_size = grid_size
             grid_size = (min_grid_size + max_grid_size) / 2
         else:
             min_grid_size = grid_size
             grid_size = (min_grid_size + max_grid_size) / 2
-    return grid_size
+    return best_grid_size
 
 
 def binary_erosion(image_tensor: torch.Tensor, kernel_size: int) -> torch.Tensor:

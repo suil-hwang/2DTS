@@ -108,7 +108,7 @@ namespace Params
 		}
 
 		void fromChunk(char*& chunk, size_t N) override {
-			obtain(chunk, ranges, N, 128);
+			obtain(chunk, ranges, N + 1, 128); // include the ignored-tile sentinel for 1x1 images
 			obtain(chunk, n_contribs, N, 128);
 			obtain(chunk, final_Ts, N, 128);
 		}
@@ -204,6 +204,7 @@ namespace Params
 		const float *dL_dout_depth;
 		const float *dL_dout_normal;
 		const float *dL_dout_distortion;
+		const float *dL_dout_alpha_mask;
 	};
 	
 	struct BackwardOutput

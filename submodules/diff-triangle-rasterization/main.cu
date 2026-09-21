@@ -71,10 +71,12 @@ int main()
     torch::Tensor distortion;
     torch::Tensor contrib_sum;
     torch::Tensor contrib_max;
+    torch::Tensor n_contribs;
+    torch::Tensor final_Ts;
     torch::Tensor geometryBuffer;
     torch::Tensor binningBuffer;
     torch::Tensor imageBuffer;
-    std::tie(num_rendered, out_feature, radii, depth, normal, distortion, contrib_sum, contrib_max, geometryBuffer, binningBuffer, imageBuffer) = forward_result;
+    std::tie(num_rendered, out_feature, radii, depth, normal, distortion, contrib_sum, contrib_max, n_contribs, final_Ts, geometryBuffer, binningBuffer, imageBuffer) = forward_result;
 
     std::cout << "num_rendered: " << num_rendered << std::endl;
     std::cout << "Calling rasterizeTrianglesBackward" << std::endl;
@@ -83,6 +85,7 @@ int main()
     torch::Tensor dL_dout_depth = torch::rand({image_height, image_width}).to(device);
     torch::Tensor dL_dout_normal = torch::rand({3, image_height, image_width}).to(device);
     torch::Tensor dL_dout_distortion = torch::rand({image_height, image_width}).to(device);
+    torch::Tensor dL_dout_alpha_mask = torch::zeros({image_height, image_width}).to(device);
 
     auto backward_result = rasterizeTrianglesBackward(
         tan_fovx,
@@ -111,6 +114,7 @@ int main()
         dL_dout_depth,
         dL_dout_normal,
         dL_dout_distortion,
+        dL_dout_alpha_mask,
         back_culling,
         rich_info,
         sort_level,

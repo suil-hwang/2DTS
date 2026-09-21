@@ -4,8 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import scipy.special
 from pathlib import Path
-from copy import deepcopy
-import cv2
+from copy import copy
 
 from .point_cloud import PointCloud
 from .raw_triangle import RawTriangle
@@ -15,12 +14,13 @@ from ..utils.camera import Camera
 from ..utils.config import Config
 from ..utils.logger import Logger, stdout_logger
 from ..utils.scheduler import exponential_scheduler, exponential_step_scheduler, linear_scheduler
-from ..utils.sh_utils import RGB2SH, SH2RGB
-from ..utils.vis_utils import save_image_tensor, plot_distribution
+from ..utils.sh_utils import RGB2SH
 from ..trainers.trainer_utils import ScharrFilter
 
 
 class TSModel(nn.Module):
+    _STATISTIC_NAMES = ("gradient_accum", "gradient_denom", "max_radii2D", "contrib_sum", "contrib_max", "contrib_denom")
+
     def __init__(self, config: Config = None, logger: Logger = None, device: torch.device | int = None):
         super().__init__()
         self.config = config if config is not None else Config()
@@ -32,9 +32,9 @@ class TSModel(nn.Module):
         self.use_color_affine = config.use_color_affine if config.use_color_affine is not None else False
         self.back_culling = config.back_culling if config.back_culling is not None else False
         self.back_culling_prob = config.back_culling_prob if config.back_culling_prob is not None else 1.0
-        self.ste_threshold = config.ste_threshold if config.ste_threshold is not None else None
+        self.ste_threshold = config.ste_threshold
         self.gamma_rescale = config.gamma_rescale if config.gamma_rescale is not None else False
-        self.render_spp = config.render_spp if config.render_spp is not None else None
+        self.render_spp = config.render_spp
         self.use_vertex_color = config.use_vertex_color if config.use_vertex_color is not None else False
         self.sort_level = config.sort_level if config.sort_level is not None else 0
 
@@ -53,35 +53,12 @@ class TSModel(nn.Module):
     def get_xyz(self):
         return self._vertex.mean(dim=1)
 
-    # @property
-    # def get_scaling(self):
-    #     """
-    #     calculate the radius of the smallest enclosing circle of each triangle
-    #     """
-    #     side_1 = self._vertex[:, 2] - self._vertex[:, 1]
-    #     side_2 = self._vertex[:, 0] - self._vertex[:, 2]
-    #     side_3 = self._vertex[:, 1] - self._vertex[:, 0]
-    #     l_side1 = side_1.norm(dim=1)
-    #     l_side2 = side_2.norm(dim=1)
-    #     l_side3 = side_3.norm(dim=1)
-    #     sq_side1 = l_side1**2
-    #     sq_side2 = l_side2**2
-    #     sq_side3 = l_side3**2
-    #     is_obtuse = torch.stack((sq_side1 + sq_side2 < sq_side3, sq_side2 + sq_side3 < sq_side1, sq_side3 + sq_side1 < sq_side2), dim=1).any(dim=1)
-
-    #     area = torch.cross(side_1, side_2, dim=1).norm(dim=1) / 2 + 1e-10
-    #     circumradius = l_side1 * l_side2 * l_side3 / (4 * area)
-    #     l_side_max = torch.stack((l_side1, l_side2, l_side3), dim=1).max(dim=1).values
-    #     circumradius[is_obtuse] = l_side_max[is_obtuse] / 2
-
-    #     return circumradius
-
     @property
     def get_scaling(self):
         l_side1 = (self._vertex[:, 2] - self._vertex[:, 1]).norm(dim=1)
         l_side2 = (self._vertex[:, 0] - self._vertex[:, 2]).norm(dim=1)
         l_side3 = (self._vertex[:, 1] - self._vertex[:, 0]).norm(dim=1)
-        return torch.stack((l_side1, l_side2, l_side3), dim=1).mean(dim=1)
+        return (l_side1 + l_side2 + l_side3) / 3
 
     @property
     def get_area(self):
@@ -97,18 +74,29 @@ class TSModel(nn.Module):
     def get_opacity(self):
         return torch.sigmoid(self._opacity) * (1.0 - self.opacity_floor) + self.opacity_floor
 
+    def _inverse_opacity(self, opacity: torch.Tensor | float) -> torch.Tensor:
+        """Invert effective opacity, clamping unreachable endpoints to finite logits."""
+        opacity = torch.as_tensor(opacity, dtype=self._opacity.dtype, device=self._opacity.device)
+        if self.opacity_floor == 1.0:
+            return torch.zeros_like(opacity)
+        probability = (opacity - self.opacity_floor) / (1.0 - self.opacity_floor)
+        zero, one = probability.new_tensor(0.0), probability.new_tensor(1.0)
+        lower, upper = torch.nextafter(zero, one), torch.nextafter(one, zero)
+        return inverse_sigmoid(probability.clamp(lower, upper))
+
+    @torch.no_grad()
     def set_opacity(self, opacity: float):
-        self._opacity.data.fill_(inverse_sigmoid(opacity))
+        self._opacity.fill_(self._inverse_opacity(opacity))
 
     def setup_color_affine(self, view_count):
         if not self.use_color_affine:
             return
 
-        self._color_affine_weight = nn.Parameter(torch.zeros((view_count, 3, 3)).float().to(self.device), requires_grad=True)
+        self._color_affine_weight = nn.Parameter(torch.zeros((view_count, 3, 3), dtype=torch.float32, device=self.device), requires_grad=True)
         self._color_affine_weight.data[:, 0, 0] = 1
         self._color_affine_weight.data[:, 1, 1] = 1
         self._color_affine_weight.data[:, 2, 2] = 1
-        self._color_affine_bias = nn.Parameter(torch.zeros((view_count, 3)).float().to(self.device), requires_grad=True)
+        self._color_affine_bias = nn.Parameter(torch.zeros((view_count, 3), dtype=torch.float32, device=self.device), requires_grad=True)
 
     def setup_scene_info(self, scene_info: dict = None):
         if scene_info is None:
@@ -117,14 +105,14 @@ class TSModel(nn.Module):
         self.scene_bbox = scene_info["bbox_xyz"]
 
     def _setup_parameters(self, point_count: int):
-        self._vertex = nn.Parameter(torch.empty(point_count, 3, 3).float().to(self.device), requires_grad=True)
-        self._opacity = nn.Parameter(torch.empty(point_count, 1).float().to(self.device), requires_grad=True)
+        self._vertex = nn.Parameter(torch.empty(point_count, 3, 3, dtype=torch.float32, device=self.device), requires_grad=True)
+        self._opacity = nn.Parameter(torch.empty(point_count, 1, dtype=torch.float32, device=self.device), requires_grad=True)
         if self.use_vertex_color:
-            self._f_dc = nn.Parameter(torch.empty(point_count, 3, 1, 3).float().to(self.device), requires_grad=True)
-            self._f_rest = nn.Parameter(torch.empty(point_count, 3, (self.max_sh_degree + 1) ** 2 - 1, 3).float().to(self.device), requires_grad=True)
+            self._f_dc = nn.Parameter(torch.empty(point_count, 3, 1, 3, dtype=torch.float32, device=self.device), requires_grad=True)
+            self._f_rest = nn.Parameter(torch.empty(point_count, 3, (self.max_sh_degree + 1) ** 2 - 1, 3, dtype=torch.float32, device=self.device), requires_grad=True)
         else:
-            self._f_dc = nn.Parameter(torch.empty(point_count, 1, 3).float().to(self.device), requires_grad=True)
-            self._f_rest = nn.Parameter(torch.empty(point_count, (self.max_sh_degree + 1) ** 2 - 1, 3).float().to(self.device), requires_grad=True)
+            self._f_dc = nn.Parameter(torch.empty(point_count, 1, 3, dtype=torch.float32, device=self.device), requires_grad=True)
+            self._f_rest = nn.Parameter(torch.empty(point_count, (self.max_sh_degree + 1) ** 2 - 1, 3, dtype=torch.float32, device=self.device), requires_grad=True)
 
     def _setup_optimizer(self):
         if self.config.optimizer is None:
@@ -220,12 +208,8 @@ class TSModel(nn.Module):
                 max_steps=args.opacity_scheduler.end_iter - args.opacity_scheduler.start_iter,
             )
 
-        self.gradient_accum = torch.zeros((self._vertex.shape[0]), device=self.device)
-        self.gradient_denom = torch.zeros((self._vertex.shape[0]), device=self.device)
-        self.max_radii2D = torch.zeros((self._vertex.shape[0]), device=self.device)
-        self.contrib_sum = torch.zeros((self._vertex.shape[0]), device=self.device)
-        self.contrib_max = torch.zeros((self._vertex.shape[0]), device=self.device)
-        self.contrib_denom = torch.zeros((self._vertex.shape[0]), device=self.device)
+        for name in self._STATISTIC_NAMES:
+            setattr(self, name, torch.zeros(self._vertex.shape[0], device=self.device))
 
     def _training_setup(self):
         self._setup_optimizer()
@@ -236,7 +220,7 @@ class TSModel(nn.Module):
     def update_learning_rate(self, iteration):
         for param_group in self.optimizer.param_groups:
             if param_group["name"] in self.lr_schedulers:
-                param_group["lr"] = self.lr_schedulers[param_group["name"]](iteration)
+                param_group["lr"] = float(self.lr_schedulers[param_group["name"]](iteration))
 
     def _prune_points_update_states(self, mask: torch.Tensor):
         # update optimizer and parameter after runing _prune_points
@@ -257,13 +241,10 @@ class TSModel(nn.Module):
             self.__setattr__(f"_{group['name']}", new_param)
 
     def _prune_points(self, prune_mask: torch.Tensor):
-        self.gradient_accum = self.gradient_accum[~prune_mask]
-        self.gradient_denom = self.gradient_denom[~prune_mask]
-        self.max_radii2D = self.max_radii2D[~prune_mask]
-        self.contrib_sum = self.contrib_sum[~prune_mask]
-        self.contrib_max = self.contrib_max[~prune_mask]
-        self.contrib_denom = self.contrib_denom[~prune_mask]
-        self._prune_points_update_states(~prune_mask)
+        keep_mask = ~prune_mask
+        for name in self._STATISTIC_NAMES:
+            setattr(self, name, getattr(self, name)[keep_mask])
+        self._prune_points_update_states(keep_mask)
 
     def _grow_points_update_states(self, tensors_dict: dict[str, torch.Tensor]):
         # update optimizer and parameter after runing _grow_points
@@ -290,29 +271,29 @@ class TSModel(nn.Module):
         split_scale_threshold = args.split_scale_threshold if args.split_scale_threshold is not None else 0.0
         split_radii_threshold = args.split_radii_threshold if args.split_radii_threshold is not None else 0.0
 
-        large_point_mask = self.get_scaling > split_scale_threshold
+        scaling = self.get_scaling
+        large_point_mask = scaling > split_scale_threshold
         large_point_mask &= self.max_radii2D >= split_radii_threshold
         clone_mask = grow_mask & ~large_point_mask  # clone small points
         split_mask = grow_mask & large_point_mask  # split large points
 
         # generate clone points
         clone_vertex = self._vertex[clone_mask]
-        # clone_opacity = self._opacity[clone_mask]
         clone_opacity = self.get_opacity[clone_mask]
-        clone_opacity = inverse_sigmoid(1 - (1 - clone_opacity) ** 0.5)  # keep the contribution decay constant after cloning
+        clone_opacity = inverse_sigmoid(1 - (1 - clone_opacity) ** 0.5)  # heuristic opacity for the added clone
         clone_f_dc = self._f_dc[clone_mask]
         clone_f_rest = self._f_rest[clone_mask]
 
         clone_normal = torch.cross(clone_vertex[:, 1] - clone_vertex[:, 0], clone_vertex[:, 2] - clone_vertex[:, 0], dim=1)
         clone_normal = F.normalize(clone_normal, dim=1).unsqueeze(1)  # (N, 1, 3)
-        clone_scaling = self.get_scaling[clone_mask].unsqueeze(-1).unsqueeze(-1)  # (N, 1, 1)
+        clone_scaling = scaling[clone_mask].unsqueeze(-1).unsqueeze(-1)  # (N, 1, 1)
         clone_offset = torch.randn_like(clone_vertex) * clone_scaling  # (N, 3, 3)
         clone_offset = clone_offset - (clone_offset * clone_normal).sum(dim=-1, keepdim=True) * clone_normal  # project to the plane
         clone_vertex = clone_vertex + clone_offset
 
         # generate split points
+        split_vertex_ori = self._vertex[split_mask]
         if split_num == 2:  # cut from the center of the longest edge to the opposite vertex
-            split_vertex_ori = self._vertex[split_mask]
             side1 = split_vertex_ori[:, 2] - split_vertex_ori[:, 1]
             side2 = split_vertex_ori[:, 0] - split_vertex_ori[:, 2]
             side3 = split_vertex_ori[:, 1] - split_vertex_ori[:, 0]
@@ -325,14 +306,12 @@ class TSModel(nn.Module):
             split_triangle_2 = torch.stack((split_vertex_ori[r, l_side], l_side_center, split_vertex_ori[r, l_side_p2]), dim=1)
             split_vertex = torch.cat((split_triangle_1, split_triangle_2), dim=0)
         elif split_num == 3:  # cut from the barycenter to each vertex
-            split_vertex_ori = self._vertex[split_mask]
             barycenter = split_vertex_ori.mean(dim=1)
             split_triangle_1 = torch.stack((split_vertex_ori[:, 0], split_vertex_ori[:, 1], barycenter), dim=1)
             split_triangle_2 = torch.stack((split_vertex_ori[:, 1], split_vertex_ori[:, 2], barycenter), dim=1)
             split_triangle_3 = torch.stack((split_vertex_ori[:, 2], split_vertex_ori[:, 0], barycenter), dim=1)
             split_vertex = torch.cat((split_triangle_1, split_triangle_2, split_triangle_3), dim=0)
         elif split_num == 4:  # cut among the center of each edge
-            split_vertex_ori = self._vertex[split_mask]
             center1 = (split_vertex_ori[:, 1] + split_vertex_ori[:, 2]) / 2
             center2 = (split_vertex_ori[:, 0] + split_vertex_ori[:, 2]) / 2
             center3 = (split_vertex_ori[:, 0] + split_vertex_ori[:, 1]) / 2
@@ -363,12 +342,8 @@ class TSModel(nn.Module):
         self._prune_points(split_mask)
 
         new_points_count = new_vertex.shape[0]
-        self.gradient_accum = F.pad(self.gradient_accum, (0, new_points_count), value=0)
-        self.gradient_denom = F.pad(self.gradient_denom, (0, new_points_count), value=0)
-        self.max_radii2D = F.pad(self.max_radii2D, (0, new_points_count), value=0)
-        self.contrib_sum = F.pad(self.contrib_sum, (0, new_points_count), value=0)
-        self.contrib_max = F.pad(self.contrib_max, (0, new_points_count), value=0)
-        self.contrib_denom = F.pad(self.contrib_denom, (0, new_points_count), value=0)
+        for name in self._STATISTIC_NAMES:
+            setattr(self, name, F.pad(getattr(self, name), (0, new_points_count)))
         self._grow_points_update_states(new_points)
         return clone_mask.sum().item(), split_mask.sum().item()
 
@@ -390,24 +365,21 @@ class TSModel(nn.Module):
             group["params"][0] = new_param
             self.__setattr__(f"_{group['name']}", new_param)
 
-    def _clipping_update_states(self, clip_mask: torch.Tensor, clip_value: float, name: str):
-        # update optimizer and parameter after runing _scale_clipping or _opacity_clipping
+    @torch.no_grad()
+    def _clipping_update_states(self, clip_mask: torch.Tensor, clip_value: torch.Tensor | float, name: str):
+        """Clip in place and reset affected Adam moments, retaining the Parameter."""
         for group in self.optimizer.param_groups:
-            if not group["name"] == name:
+            if group["name"] != name:
                 continue
 
             param = group["params"][0]
-            new_param = nn.Parameter(param, requires_grad=True)
-            new_param[clip_mask] = clip_value
+            param[clip_mask] = clip_value
+            param.grad = None
 
-            stored_state = self.optimizer.state.pop(param, None)
+            stored_state = self.optimizer.state.get(param)
             if stored_state:
                 stored_state["exp_avg"][clip_mask] = 0.0
                 stored_state["exp_avg_sq"][clip_mask] = 0.0
-                self.optimizer.state[new_param] = stored_state
-
-            group["params"][0] = new_param
-            self.__setattr__(f"_{name}", new_param)
 
     def _training_statistic(self, iteration: int, render_pkg: dict[str, torch.Tensor] = None):
         args = self.config.model_update.statistic
@@ -529,12 +501,13 @@ class TSModel(nn.Module):
         scale_threshold = args.scale_threshold
         min_area_threshold = args.min_area_threshold
 
-        width, height = render_pkg["camera"].image_width, render_pkg["camera"].image_height
         if radii_threshold == -1:
+            width, height = render_pkg["camera"].image_width, render_pkg["camera"].image_height
             radii_threshold = max(width, height)
         elif isinstance(radii_threshold, float) and 0 < radii_threshold < 1:
+            width, height = render_pkg["camera"].image_width, render_pkg["camera"].image_height
             radii_threshold = int(max(width, height) * radii_threshold)
-        elif radii_threshold is None:
+        elif radii_threshold is not None:
             assert isinstance(radii_threshold, int) and radii_threshold > 0, "radii_threshold should be a positive float or int"
 
         radii_prune_mask = self.max_radii2D >= radii_threshold if radii_threshold is not None else torch.zeros_like(self.max_radii2D, dtype=torch.bool)
@@ -560,8 +533,7 @@ class TSModel(nn.Module):
         """
         vertex = self._vertex[rescale_mask] if rescale_mask is not None else self._vertex
         if isinstance(rescale_ratio, torch.Tensor):
-            assert rescale_ratio.dim() == 1 and rescale_ratio.size(0) == vertex.size(0)
-            rescale_ratio = rescale_ratio.unsqueeze(1).unsqueeze(1)
+            rescale_ratio = rescale_ratio.reshape(vertex.shape[0], 1, 1)
 
         t_center = vertex.mean(dim=1, keepdim=True)
         rescaled_vertex = (vertex - t_center) * rescale_ratio + t_center
@@ -605,13 +577,8 @@ class TSModel(nn.Module):
             return 0
         target_point_num = target_point_num * total_point_count / valid_point_count
 
-        if type == "grow":
-            diff_point_count = max(0, (target_point_num * 1.01 - total_point_count) * ratio)
-        elif type == "prune":
-            diff_point_count = max(0, (total_point_count - target_point_num * 0.99) * ratio)
-        else:
-            raise ValueError(f"Unsupported type: {type}, only support 'grow' or 'prune'")
-        return int(diff_point_count)
+        difference = {"grow": target_point_num * 1.01 - total_point_count, "prune": total_point_count - target_point_num * 0.99}[type]
+        return int(max(0, difference * ratio))
 
     def _contribution_pruning(self, iteration: int):
         args = self.config.model_update.contribution_pruning
@@ -700,10 +667,9 @@ class TSModel(nn.Module):
         reset_value = args.reset_value
 
         opacity_old = self.get_opacity
-        opacity_reset = torch.ones_like(opacity_old) * reset_value
         reset_mask = opacity_old > reset_value
 
-        opacity_new = inverse_sigmoid(torch.min(opacity_old, opacity_reset))
+        opacity_new = self._inverse_opacity(opacity_old.clamp(max=reset_value))
         self._reset_opacity_update_states({"opacity": opacity_new})
         self.logger.info(f"[ITER {iteration}, opacity reset] Reset opacity of {reset_mask.sum().item()} points to {reset_value}")
 
@@ -726,10 +692,7 @@ class TSModel(nn.Module):
         if args is None:
             return
 
-        active_sh_degree = 0
-        for iter in args.one_up_iters:
-            if iteration > iter:
-                active_sh_degree += 1
+        active_sh_degree = sum(1 for step in args.one_up_iters if iteration > step)
         self.active_sh_degree = min(active_sh_degree, self.max_sh_degree)
 
     def state_update(self, iteration: int):
@@ -773,43 +736,38 @@ class TSModel(nn.Module):
         Render the scene.
         """
         color_affine = color_affine if color_affine is not None else self.use_color_affine
-        # back_culling = back_culling if back_culling is not None else self.back_culling
         sh_degree = sh_degree if sh_degree is not None else self.active_sh_degree
         gamma = gamma if gamma is not None else self.gamma
         sort_level = sort_level if sort_level is not None else self.sort_level
         if back_culling is None:
-            if not is_training:
-                back_culling = self.back_culling
-            elif self.back_culling and torch.rand(1).item() < self.back_culling_prob:
-                back_culling = True
-            else:
-                back_culling = False
+            back_culling = self.back_culling and (not is_training or torch.rand(1).item() < self.back_culling_prob)
 
         bg_color = get_color_tensor(background).to(self.device) if background is not None else camera.bg_color
-        if bg_color is None:
-            raise ValueError("Background color must be specified or camera must have a background color.")
 
         vertex = self.get_vertex
         shs = self.get_features if shs is None else shs
         opacity = self.get_opacity
 
-        # rescale triangles to keep the integration of triangle opacity invariant under different gamma
+        # Normalize the untruncated planar kernel integral across gamma.
         if self.gamma_rescale:
             beta = 1 / gamma
-            rescale_ratio = 1 / np.sqrt(2**beta * beta * scipy.special.gamma(beta))
+            rescale_ratio = np.exp(-0.5 * (beta * np.log(2.0) + scipy.special.gammaln(beta + 1.0)))
             vertex_rescale = self._rescale_triangles(rescale_ratio)
 
         ste_threshold = ste_threshold if ste_threshold is not None else self.ste_threshold
         if ste_threshold is not None:
             opacity_ste = ((opacity >= ste_threshold).float() - opacity).detach() + opacity
 
-        bg_depth = (camera.camera_center.view(1, 1, 3) - vertex).norm(dim=-1).max().item()
+        bg_depth = 0.0
+        if is_training:
+            bg_depth = (camera.camera_center.view(1, 1, 3) - vertex).norm(dim=-1).max().item() if vertex.shape[0] else camera.zfar
         supersampling = self.render_spp is not None and self.render_spp > 1
+        output_camera = camera
 
         if supersampling:
             assert isinstance(self.render_spp, int)
             w, h = camera.image_width, camera.image_height
-            camera = deepcopy(camera)
+            camera = copy(camera)
             camera.image_width = w * self.render_spp
             camera.image_height = h * self.render_spp
 
@@ -831,21 +789,21 @@ class TSModel(nn.Module):
         )
 
         if supersampling:
-            output_pkg["render"] = F.interpolate(output_pkg["render"].unsqueeze(0), size=(h, w), mode="bilinear").squeeze(0)
+            for name in ("render", "depth", "normal", "distortion", "alpha_mask"):
+                if name in output_pkg:
+                    value = output_pkg[name]
+                    resized = F.interpolate(value.reshape(1, -1, *value.shape[-2:]), size=(h, w), mode="bilinear")
+                    output_pkg[name] = resized.reshape(*value.shape[:-2], h, w)
             if "radii" in output_pkg:
                 output_pkg["radii"] = output_pkg["radii"] // self.render_spp
-            if "depth" in output_pkg:
-                output_pkg["depth"] = F.interpolate(output_pkg["depth"].unsqueeze(0).unsqueeze(0), size=(h, w), mode="bilinear").squeeze(0).squeeze(0)
-            if "normal" in output_pkg:
-                output_pkg["normal"] = F.interpolate(output_pkg["normal"].unsqueeze(0), size=(h, w), mode="bilinear").squeeze(0)
-            if "distortion" in output_pkg:
-                output_pkg["distortion"] = F.interpolate(output_pkg["distortion"].unsqueeze(0).unsqueeze(0), size=(h, w), mode="bilinear").squeeze(0).squeeze(0)
-            if "alpha_mask" in output_pkg:
-                output_pkg["alpha_mask"] = F.interpolate(output_pkg["alpha_mask"].unsqueeze(0).unsqueeze(0), size=(h, w), mode="bilinear").squeeze(0).squeeze(0)
+            if "n_contribs" in output_pkg:
+                # Report the maximum contributor count among this pixel's samples.
+                counts = output_pkg["n_contribs"]
+                output_pkg["n_contribs"] = counts.reshape(h, self.render_spp, w, self.render_spp).amax(dim=(1, 3))
 
         if is_training:
             render_pkg = {
-                "camera": camera,
+                "camera": output_camera,
                 "scaling": self.get_scaling,
                 "opacity": opacity,
                 "vertex": vertex,
@@ -885,11 +843,6 @@ class TSModel(nn.Module):
 
         mask = render_pkg["alpha_mask"] > alpha_thres
 
-        # erode the mask to remove boundary points
-        # mask = mask.cpu().numpy()
-        # mask = cv2.erode(mask.astype(np.uint8), np.ones((7, 7), dtype=np.uint8), iterations=1).astype(bool)
-        # mask = torch.tensor(mask, device=self.device)
-
         if depth_grad_quantile is not None and 0 <= depth_grad_quantile < 1:
             depth_grad = ScharrFilter()(render_pkg["depth"].unsqueeze(0).unsqueeze(0), ret_norm=True).squeeze()
             depth_grad_mask = depth_grad < torch.quantile(depth_grad, depth_grad_quantile)
@@ -920,7 +873,7 @@ class TSModel(nn.Module):
     def toRawTriangle(self, bbox_filtering: bool = True) -> RawTriangle:
         vertex = self._vertex
         opacity = self._opacity
-        shs = self.get_features.view(vertex.shape[0], 3, -1) if self.use_vertex_color else self.get_features.view(vertex.shape[0], -1)
+        shs = self.get_features.flatten(start_dim=-2)
 
         if bbox_filtering and self.scene_bbox is not None:
             mask = get_inside_mask(self.get_xyz, self.scene_bbox)
@@ -929,21 +882,21 @@ class TSModel(nn.Module):
             shs = shs[mask]
 
         if self.ste_threshold is not None:
-            ste_mask = torch.sigmoid(opacity).squeeze() > self.ste_threshold
+            ste_mask = torch.sigmoid(opacity).squeeze(-1) > self.ste_threshold
             vertex = vertex[ste_mask]
             opacity = ste_mask[ste_mask].unsqueeze(-1).float() * 10
             shs = shs[ste_mask]
         return RawTriangle(*to_numpy(vertex, opacity, shs))
 
     def fromRawTriangle(self, triangle_model: RawTriangle) -> "TSModel":
-        np = triangle_model.vertex.shape[0]
+        point_count = triangle_model.vertex.shape[0]
         use_vertex_color = len(triangle_model.shs.shape) == 3
         if use_vertex_color != self.use_vertex_color:
             raise ValueError(f"Model use_vertex_color {self.use_vertex_color} does not match triangle_model use_vertex_color {use_vertex_color}")
 
-        shs = torch.tensor(triangle_model.shs).float().to(self.device)
-        shs = shs.view(np, 3, -1, 3) if self.use_vertex_color else shs.view(np, -1, 3)
-        features = torch.zeros((np, (self.max_sh_degree + 1) ** 2, 3)).float().to(self.device)
+        shs = torch.tensor(triangle_model.shs, dtype=torch.float32, device=self.device)
+        shs = shs.unflatten(-1, (-1, 3))
+        features = torch.zeros((point_count, (self.max_sh_degree + 1) ** 2, 3), dtype=torch.float32, device=self.device)
         if self.use_vertex_color:
             features = features.unsqueeze(1).repeat(1, 3, 1, 1)
         if shs.shape[-2] > features.shape[-2]:
@@ -951,8 +904,8 @@ class TSModel(nn.Module):
         else:
             features[..., : shs.shape[-2], :] = shs
 
-        self._vertex = nn.Parameter(torch.tensor(triangle_model.vertex).float().to(self.device), requires_grad=True)
-        self._opacity = nn.Parameter(torch.tensor(triangle_model.opacity).float().to(self.device), requires_grad=True)
+        self._vertex = nn.Parameter(torch.tensor(triangle_model.vertex, dtype=torch.float32, device=self.device), requires_grad=True)
+        self._opacity = nn.Parameter(torch.tensor(triangle_model.opacity, dtype=torch.float32, device=self.device), requires_grad=True)
         self._f_dc = nn.Parameter(features[..., :1, :].contiguous(), requires_grad=True)
         self._f_rest = nn.Parameter(features[..., 1:, :].contiguous(), requires_grad=True)
 
@@ -973,18 +926,35 @@ class TSModel(nn.Module):
         self.logger.info(f"Saving checkpoint to {ckpt_path}")
         Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
 
-        save_items = (self.state_dict(), self.optimizer.state_dict(), self.scene_bbox, self.gamma)
-        torch.save(save_items, open(ckpt_path, "wb"))
+        runtime_state = {
+            "version": 1,
+            "active_sh_degree": int(self.active_sh_degree),
+            "opacity_floor": float(self.opacity_floor),
+            "statistics": {name: getattr(self, name) for name in self._STATISTIC_NAMES} if self.config.model_update is not None else {},
+        }
+        scene_bbox = None if self.scene_bbox is None else [float(value) for value in self.scene_bbox]
+        save_items = (self.state_dict(), self.optimizer.state_dict(), scene_bbox, float(self.gamma), runtime_state)
+        torch.save(save_items, ckpt_path)
 
     def load_ckpt(self, ckpt_path: str) -> "TSModel":
-        (params_state_dict, optimizer_state_dict, self.scene_bbox, self.gamma) = torch.load(open(ckpt_path, "rb"))
+        params_state_dict, optimizer_state_dict, self.scene_bbox, self.gamma, runtime_state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        if runtime_state["version"] != 1:
+            raise ValueError("Unsupported TSModel checkpoint runtime version")
+        statistics = runtime_state["statistics"]
 
         point_count = params_state_dict["_vertex"].shape[0]
         self._setup_parameters(point_count)
+        if self.use_color_affine:
+            self.setup_color_affine(params_state_dict["_color_affine_weight"].shape[0])
         self.load_state_dict(params_state_dict)
 
         self._training_setup()
         self.optimizer.load_state_dict(optimizer_state_dict)
+        self.active_sh_degree = int(runtime_state["active_sh_degree"])
+        self.opacity_floor = float(runtime_state["opacity_floor"])
+        if self.config.model_update is not None:
+            for name in self._STATISTIC_NAMES:
+                setattr(self, name, statistics[name].reshape(point_count).to(self.device))
         return self
 
     def _sample_points(
@@ -996,19 +966,10 @@ class TSModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         args = self.config.sampling
         sample_method = args.sample_method
-        n_sample_inside = args.n_sample_inside
-        n_sample_outside = args.n_sample_outside
-        grid_size_inside = args.grid_size_inside
-        grid_size_outside = args.grid_size_outside
-
-        if name == "inside":
-            n_sample = n_sample_inside
-            grid_size = grid_size_inside
-        elif name == "outside":
-            n_sample = n_sample_outside
-            grid_size = grid_size_outside
-        else:
-            raise ValueError(f"Unknown sampling name: {name}")
+        n_sample, grid_size = {
+            "inside": (args.n_sample_inside, args.grid_size_inside),
+            "outside": (args.n_sample_outside, args.grid_size_outside),
+        }[name]
 
         self.logger.info(f"Running {name} sampling")
         if sample_method == "random":
@@ -1020,7 +981,10 @@ class TSModel(nn.Module):
         elif sample_method == "grid":
             grid_size = grid_size_search(points, n_sample) if grid_size is None else grid_size
             sampled_points, sampled_shs, sampled_normals = grid_sampling(points, shs, normals, grid_size=grid_size)
-            sampled_normals = sampled_normals / sampled_normals.norm(dim=1, keepdim=True)
+            lengths = sampled_normals.norm(dim=1, keepdim=True)
+            valid_normals = torch.isfinite(lengths) & (lengths > 1e-12)
+            sampled_normals = torch.where(valid_normals, sampled_normals, sampled_normals.new_tensor([0., 0., 1.]))
+            sampled_normals = F.normalize(sampled_normals, dim=1)
         elif sample_method == "direct":
             sampled_points, sampled_shs, sampled_normals = points, shs, normals
         else:
@@ -1034,8 +998,6 @@ class TSModel(nn.Module):
 
     def random_pcd(self) -> PointCloud:
         config = self.config.random_init
-        if config is None:
-            raise ValueError("Random initialization config is not provided")
 
         bbox_list = config.bbox_list
         point_num_list = config.point_num_list
@@ -1048,10 +1010,9 @@ class TSModel(nn.Module):
             colors = np.random.rand(point_num, 3).astype(np.float32)
             if normal == "random":
                 normals = np.random.randn(point_num, 3).astype(np.float32)
-                normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
             else:
                 normals = np.tile(np.array(normal, dtype=np.float32), (point_num, 1))
-                normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+            normals /= np.linalg.vector_norm(normals, axis=1, keepdims=True)
             pcd += PointCloud(points=points, colors=colors, normals=normals)
 
         return pcd
@@ -1061,18 +1022,19 @@ class TSModel(nn.Module):
             pcd = self.random_pcd()
 
         args = self.config.sampling
-        if args is None:
-            raise ValueError("Sampling config is not provided")
 
         init_opacity = args.init_opacity if args.init_opacity is not None else 0.1
         duplicate_count = args.duplicate_count if args.duplicate_count is not None else 1
 
-        points = torch.tensor(np.asarray(pcd.points)).float().to(self.device)
-        shs = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().to(self.device))
-        normals = torch.tensor(np.asarray(pcd.normals)).float().to(self.device)
+        points = torch.tensor(np.asarray(pcd.points), dtype=torch.float32, device=self.device)
+        shs = RGB2SH(torch.tensor(np.asarray(pcd.colors), dtype=torch.float32, device=self.device))
+        normals = torch.tensor(np.asarray(pcd.normals), dtype=torch.float32, device=self.device)
         if not normals.any():
             normals = torch.randn_like(points)
-        normals = normals / normals.norm(dim=1, keepdim=True)
+        lengths = normals.norm(dim=1, keepdim=True)
+        valid_normals = torch.isfinite(lengths) & (lengths > 1e-12)
+        normals = torch.where(valid_normals, normals, normals.new_tensor([0., 0., 1.]))
+        normals = F.normalize(normals, dim=1)
 
         inside_mask = get_inside_mask(points, self.scene_bbox)
 
@@ -1094,8 +1056,8 @@ class TSModel(nn.Module):
         if init_opacity == "random":
             opacities = inverse_sigmoid(torch.rand((points.shape[0], 1)).float().to(self.device))
         else:
-            opacities = inverse_sigmoid(torch.ones((points.shape[0], 1)).float().to(self.device) * init_opacity)
-        features = torch.zeros((shs.shape[0], (self.max_sh_degree + 1) ** 2, 3)).float().to(self.device)
+            opacities = inverse_sigmoid(torch.ones((points.shape[0], 1), dtype=torch.float32, device=self.device) * init_opacity)
+        features = torch.zeros((shs.shape[0], (self.max_sh_degree + 1) ** 2, 3), dtype=torch.float32, device=self.device)
         features[:, 0, :] = shs
 
         # repeat points
@@ -1113,16 +1075,13 @@ class TSModel(nn.Module):
             normals = normals.repeat(duplicate_count, 1)
             scaling = inter_point_distance(points)[..., None]
 
-            # pcd_test = PointCloud(points=points.cpu().numpy(), colors=(SH2RGB(features[:, 0, :]).squeeze(1).cpu().numpy() * 255.0).astype(np.uint8), normals=normals.cpu().numpy())
-            # pcd_test.storePly("test.ply")
-
         # make equilateral triangles
-        up = torch.tensor([0, 0, 1]).float().to(self.device).repeat(points.shape[0], 1)
+        up = torch.tensor([0, 0, 1], dtype=torch.float32, device=self.device).repeat(points.shape[0], 1)
         u_dir = torch.cross(up, normals, dim=1)
-        u_dir[u_dir.norm(dim=1) < 1e-10] = torch.tensor([1, 0, 0]).float().to(self.device)
+        u_dir[u_dir.norm(dim=1) < 1e-10] = torch.tensor([1, 0, 0], dtype=torch.float32, device=self.device)
         u_dir = u_dir / u_dir.norm(dim=1, keepdim=True)
         v_dir = torch.cross(normals, u_dir, dim=1)
-        v_dir[v_dir.norm(dim=1) < 1e-10] = torch.tensor([0, 1, 0]).float().to(self.device)
+        v_dir[v_dir.norm(dim=1) < 1e-10] = torch.tensor([0, 1, 0], dtype=torch.float32, device=self.device)
         v_dir = v_dir / v_dir.norm(dim=1, keepdim=True)
 
         v1 = points + u_dir * scaling

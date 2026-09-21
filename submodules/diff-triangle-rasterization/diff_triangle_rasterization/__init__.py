@@ -101,6 +101,7 @@ class _RasterizeTriangles(torch.autograd.Function):
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.save_for_backward(vertex, shs, feature, opacity, radii, out_feature, depth, normal, distortion, geometryBuffer, binningBuffer, imageBuffer)
+        ctx.mark_non_differentiable(radii, contrib_sum, contrib_max, n_contribs)
 
         alpha_mask = 1 - final_Ts
         if (n_contribs < 0).any():
@@ -119,7 +120,7 @@ class _RasterizeTriangles(torch.autograd.Function):
         vertex, shs, feature, opacity, radii, out_feature, depth, normal, distortion, geometryBuffer, binningBuffer, imageBuffer = ctx.saved_tensors
 
         if raster_settings.rich_info:
-            grad_out_feature, _, grad_out_depth, grad_out_normal, grad_out_distortion, _, _, _, _, _ = grads_out
+            grad_out_feature, _, grad_out_depth, grad_out_normal, grad_out_distortion, _, _, _, grad_out_alpha_mask, _ = grads_out
         else:
             raise ValueError("Rich info must be enabled for backward pass.")
 
@@ -147,10 +148,11 @@ class _RasterizeTriangles(torch.autograd.Function):
             geometryBuffer,
             binningBuffer,
             imageBuffer,
-            grad_out_feature,
-            grad_out_depth,
-            grad_out_normal,
-            grad_out_distortion,
+            grad_out_feature.contiguous(),
+            grad_out_depth.contiguous(),
+            grad_out_normal.contiguous(),
+            grad_out_distortion.contiguous(),
+            grad_out_alpha_mask.contiguous(),
             raster_settings.back_culling,
             raster_settings.rich_info,
             raster_settings.sort_level,

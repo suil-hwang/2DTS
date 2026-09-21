@@ -7,7 +7,6 @@ from tqdm import tqdm
 
 from .trainer_utils import *
 from ..datasets.Base_dataset import BaseDatasetFactory
-from ..datasets.Colmap_dataset import ColmapDatasetFactory
 from ..models.TS_model import TSModel
 from ..models.point_cloud import PointCloud
 from ..models.model_utils import grid_sampling, to_numpy
@@ -16,7 +15,6 @@ from ..utils.config import Config, loadConfig
 from ..utils.logger import Logger
 from ..utils.camera import Camera
 from ..utils.vis_utils import save_image_tensor
-from ..utils.sh_utils import RGB2SH
 
 
 class TSTrainer:
@@ -50,7 +48,6 @@ class TSTrainer:
         torch.autograd.set_detect_anomaly(detect_anomaly)
 
         self.dataset = self._load_dataset()
-        self.model = None
 
         # Initialize model
         train_size = self.dataset.getTrainDatasetSize()
@@ -104,21 +101,24 @@ class TSTrainer:
             case "Colmap":
                 from ..datasets.Colmap_dataset import ColmapDatasetFactory
 
-                dataset = ColmapDatasetFactory(self.config.dataset, self.logger)
+                return ColmapDatasetFactory(self.config.dataset, self.logger)
             case "NerfSynthetic":
                 from ..datasets.NerfSynthetic_dataset import NerfSyntheticDatasetFactory
 
-                dataset = NerfSyntheticDatasetFactory(self.config.dataset, self.logger)
+                return NerfSyntheticDatasetFactory(self.config.dataset, self.logger)
             case "MatrixCity":
                 from ..datasets.MatrixCity_dataset import MatrixCityDatasetFactory
 
-                dataset = MatrixCityDatasetFactory(self.config.dataset, self.logger)
+                return MatrixCityDatasetFactory(self.config.dataset, self.logger)
             case _:
                 raise ValueError(f"Unknown dataset type: {dataset_type}")
 
-        return dataset
+    def _get_loss(self, iteration: int, render_pkg: dict) -> None:
+        def scheduled_weight(section, name):
+            if section is not None and iteration > section.start_iter:
+                return getattr(section, name)
+            return 0
 
-    def _get_loss(self, iteration: int, render_pkg: dict) -> torch.Tensor:
         cam: Camera = render_pkg["camera"]
         gt_image = cam.gt_image
         gt_mask = cam.alpha_mask
@@ -137,23 +137,23 @@ class TSTrainer:
         w_L2 = config.w_L2 if config.w_L2 is not None else 0
         w_ssim = config.w_ssim if config.w_ssim is not None else 0
         w_dog = config.w_dog if config.w_dog is not None else 0
-        w_geometry = config.geometry_loss.w_geometry if (config.geometry_loss is not None and iteration > config.geometry_loss.start_iter) else 0
-        w_distortion = config.distortion_loss.w_distortion if (config.distortion_loss is not None and iteration > config.distortion_loss.start_iter) else 0
+        w_geometry = scheduled_weight(config.geometry_loss, "w_geometry")
+        w_distortion = scheduled_weight(config.distortion_loss, "w_distortion")
 
-        w_smoothness_image = config.smoothness_loss.w_image if (config.smoothness_loss is not None and iteration > config.smoothness_loss.start_iter) else 0
-        w_smoothness_normal = config.smoothness_loss.w_normal if (config.smoothness_loss is not None and iteration > config.smoothness_loss.start_iter) else 0
-        w_smoothness_depth = config.smoothness_loss.w_depth if (config.smoothness_loss is not None and iteration > config.smoothness_loss.start_iter) else 0
+        w_smoothness_image = scheduled_weight(config.smoothness_loss, "w_image")
+        w_smoothness_normal = scheduled_weight(config.smoothness_loss, "w_normal")
+        w_smoothness_depth = scheduled_weight(config.smoothness_loss, "w_depth")
         smoothness_scales = (
             config.smoothness_loss.scale_factor if (config.smoothness_loss is not None and config.smoothness_loss.scale_factor is not None) else [1.0]
         )
 
-        w_consistency_geo = config.consistency_loss.w_geo if (config.consistency_loss is not None and iteration > config.consistency_loss.start_iter) else 0
-        w_consistency_color = config.consistency_loss.w_color if (config.consistency_loss is not None and iteration > config.consistency_loss.start_iter) else 0
+        w_consistency_geo = scheduled_weight(config.consistency_loss, "w_geo")
+        w_consistency_color = scheduled_weight(config.consistency_loss, "w_color")
 
         w_scaling_reg = config.w_scaling_reg if config.w_scaling_reg is not None else 0
         w_affine_reg = config.w_affine_reg if config.w_affine_reg is not None else 0
-        w_opacity_reg = config.opacity_reg.w_opacity_reg if (config.opacity_reg is not None and iteration > config.opacity_reg.start_iter) else 0
-        w_vertex_reg = config.vertex_reg.w_vertex_reg if (config.vertex_reg is not None and iteration > config.vertex_reg.start_iter) else 0
+        w_opacity_reg = scheduled_weight(config.opacity_reg, "w_opacity_reg")
+        w_vertex_reg = scheduled_weight(config.vertex_reg, "w_vertex_reg")
 
         # pixelwise losses
         if gt_mask is not None and config.train_alpha_mask:
@@ -233,7 +233,6 @@ class TSTrainer:
         render_pkg["geometry_loss"] = geometry_loss
         render_pkg["distortion_loss"] = distortion_loss
         render_pkg["vertex_loss"] = vertex_reg
-        # render_pkg["psnr"] = psnr(image, gt_image, cam.alpha_mask if config.train_alpha_mask else None)
 
     def _optimize(self, iteration: int, render_pkg: dict):
         bs = self.config.trainer.batch_size if self.config.trainer.batch_size is not None else 1
@@ -260,9 +259,6 @@ class TSTrainer:
     def _log_stats(self, log_pkg: dict):
         iteration = log_pkg["iteration"]
         loss = log_pkg["loss"]
-        geometry_loss = log_pkg["geometry_loss"]
-        distortion_loss = log_pkg["distortion_loss"]
-        vertex_loss = log_pkg["vertex_loss"]
         triangle_count = log_pkg["triangle_count"]
         gamma = log_pkg["gamma"]
         sh_degree = log_pkg["sh_degree"]
@@ -276,11 +272,14 @@ class TSTrainer:
             + f"Memory Allocated: {allocated_mem / 2**20:.2f} MB, Reserved: {reserved_mem / 2**20:.2f} MB"
         )
 
-        self.logger.add_scalar("Loss", loss, iteration)
-        self.logger.add_scalar("Geometry Loss", geometry_loss, iteration)
-        self.logger.add_scalar("Distortion Loss", distortion_loss, iteration)
-        self.logger.add_scalar("Vertex Loss", vertex_loss, iteration)
-        self.logger.add_scalar("Triangle Count", triangle_count, iteration)
+        for tag, name in (
+            ("Loss", "loss"),
+            ("Geometry Loss", "geometry_loss"),
+            ("Distortion Loss", "distortion_loss"),
+            ("Vertex Loss", "vertex_loss"),
+            ("Triangle Count", "triangle_count"),
+        ):
+            self.logger.add_scalar(tag, log_pkg[name], iteration)
         self.logger.add_scalar("Training Time (min)", time_elapsed / 60, iteration)
 
         if self.config.trainer.save_train_img:
@@ -327,23 +326,25 @@ class TSTrainer:
                 save_image_tensor(image, f"{self.output_dir}/eval/{i:>05d}.png")
                 save_image_tensor(gt_image, f"{self.output_dir}/eval_gt/{i:>05d}.png")
 
+        mean_psnr = np.mean(psnr_vals)
+        mean_ssim = np.mean(ssim_vals)
+        mean_lpips = np.mean(lpips_vals)
         if use_tensorboard:
             self._tb_gt_recorded = True
-            self.logger.add_scalar(f"Average PSNR", np.mean(psnr_vals), iteration)
-            self.logger.add_scalar(f"Average SSIM", np.mean(ssim_vals), iteration)
-            self.logger.add_scalar(f"Average LPIPS", np.mean(lpips_vals), iteration)
+            self.logger.add_scalar("Average PSNR", mean_psnr, iteration)
+            self.logger.add_scalar("Average SSIM", mean_ssim, iteration)
+            self.logger.add_scalar("Average LPIPS", mean_lpips, iteration)
 
         self.logger.info(
-            f"[ITER {iteration}] Evaluation PSNR: {np.mean(psnr_vals):.3f}, SSIM: {np.mean(ssim_vals):.3f}, LPIPS: {np.mean(lpips_vals):.3f}, "
+            f"[ITER {iteration}] Evaluation PSNR: {mean_psnr:.3f}, SSIM: {mean_ssim:.3f}, LPIPS: {mean_lpips:.3f}, "
             + f"eval view count: {len(psnr_vals)}, triangle count: {self.model.get_vertex.shape[0]}"
         )
 
         self.logger.debug("Evaluation finished")
-        eval_result = np.mean(psnr_vals)
-        return eval_result
+        return mean_psnr
 
     def _train(self):
-        dataset: ColmapDatasetFactory = self.dataset
+        dataset: BaseDatasetFactory = self.dataset
         config = self.config.trainer
 
         # Initialize model
@@ -388,6 +389,7 @@ class TSTrainer:
             if config.log_interval_iter > 0 and iteration % config.log_interval_iter == 0:
                 timer.log("logging")
                 log_pkg = {
+                    **render_pkg,
                     "iteration": iteration,
                     "triangle_count": (
                         render_pkg["opacity"].shape[0] if self.model.ste_threshold is None else (render_pkg["opacity"] > self.model.ste_threshold).sum().item()
@@ -395,13 +397,6 @@ class TSTrainer:
                     "gamma": self.model.gamma,
                     "sh_degree": self.model.active_sh_degree,
                     "time_elapsed": timer.total_duration(),
-                    "render": render_pkg["render"],
-                    "loss": render_pkg["loss"],
-                    "geometry_loss": render_pkg["geometry_loss"],
-                    "distortion_loss": render_pkg["distortion_loss"],
-                    "vertex_loss": render_pkg["vertex_loss"],
-                    "grad": render_pkg["grad"],
-                    "camera": render_pkg["camera"],
                 }
                 self._log_stats(log_pkg)
 
@@ -457,11 +452,12 @@ class TSTrainer:
         except Exception as e:
             self.logger.error(f"Training failed: {e}")
             del self.dataset
-            raise e
+            raise
 
     def evaluate(self, save_img: bool = False) -> float:
         return self._evaluate(0, use_tensorboard=False, save_img=save_img)
 
+    @torch.no_grad()
     def _save_pcd(self, ply_path: str, rescale_ratio: float = 1.0, n_sample: int = 5_000_000, grid_size: float = None):
         self.logger.info("Rendering point cloud from training views")
 

@@ -1,13 +1,10 @@
 import argparse
 
-import torch
+import igl
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 import trimesh
 import json
-
-# https://github.com/otaheri/chamfer_distance
-from chamfer_distance import ChamferDistance
 
 
 def as_mesh(scene_or_mesh):
@@ -22,12 +19,19 @@ def as_mesh(scene_or_mesh):
 
 def sample_mesh(m, n):
     vpos, _ = trimesh.sample.sample_surface(m, n)
-    return torch.tensor(vpos, dtype=torch.float32, device="cuda")
+    return np.asarray(vpos, dtype=np.float32)
+
+
+def _mean_squared_point_distance(query, reference):
+    # Keep sampled-point Chamfer: one index per primitive, not triangle faces.
+    point_indices = np.arange(len(reference), dtype=np.int64)[:, None]
+    squared, _, _ = igl.point_mesh_squared_distance(
+        np.asarray(query, dtype=np.float64), np.asarray(reference, dtype=np.float64), point_indices
+    )
+    return float(squared.mean())
 
 
 def eval_nerf_synthetic(mesh_path, ref_path, n_sample, output_dir=None):
-    chamfer_dist = ChamferDistance()
-
     mesh = as_mesh(trimesh.load(mesh_path))
     ref = as_mesh(trimesh.load(ref_path))
 
@@ -43,9 +47,8 @@ def eval_nerf_synthetic(mesh_path, ref_path, n_sample, output_dir=None):
     vpos_mesh = sample_mesh(mesh, n_sample)
     vpos_ref = sample_mesh(ref, n_sample)
 
-    d2s, s2d, _, _ = chamfer_dist(vpos_mesh[None, ...], vpos_ref[None, ...])
-    mean_d2s = torch.mean(d2s).item()
-    mean_s2d = torch.mean(s2d).item()
+    mean_d2s = _mean_squared_point_distance(vpos_mesh, vpos_ref)
+    mean_s2d = _mean_squared_point_distance(vpos_ref, vpos_mesh)
     result = {
         "mean_d2s": mean_d2s,
         "mean_s2d": mean_s2d,
