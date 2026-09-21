@@ -936,7 +936,7 @@ class TSModel(nn.Module):
         save_items = (self.state_dict(), self.optimizer.state_dict(), scene_bbox, float(self.gamma), runtime_state)
         torch.save(save_items, ckpt_path)
 
-    def load_ckpt(self, ckpt_path: str) -> "TSModel":
+    def load_ckpt(self, ckpt_path: str, load_optimizer: bool = True) -> "TSModel":
         params_state_dict, optimizer_state_dict, self.scene_bbox, self.gamma, runtime_state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         if runtime_state["version"] != 1:
             raise ValueError("Unsupported TSModel checkpoint runtime version")
@@ -949,7 +949,8 @@ class TSModel(nn.Module):
         self.load_state_dict(params_state_dict)
 
         self._training_setup()
-        self.optimizer.load_state_dict(optimizer_state_dict)
+        if load_optimizer:
+            self.optimizer.load_state_dict(optimizer_state_dict)
         self.active_sh_degree = int(runtime_state["active_sh_degree"])
         self.opacity_floor = float(runtime_state["opacity_floor"])
         if self.config.model_update is not None:

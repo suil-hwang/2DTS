@@ -78,18 +78,115 @@ tensorboard --logdir ./outputs
 ```
 
 ### Rendering
-We provide an interactive web viewer based on [Viser Viewer][3] for visualizing the trained triangle splats and meshes.
-The legacy viewer requires Viser, which is excluded from `environment.yml`. `py_viewer/` is reserved for the planned ModernGL viewer and does not yet contain an implementation.
-You can run the viewer by executing the following command:
-```bash
-python viser_viewer.py --config /path/to/config --dataset /path/to/dataset --scene {scene_name}
-```
-For example, if you ran the `NerfSynthetic` experiment and want to visualize the `ship` scene, and have the dataset stored in `./data/nerf_synthetic`, you can run the following command:
-```bash
-python viser_viewer.py --config config/NerfSynthetic_VanillaTS_mesh.yaml --dataset ./data/nerf_synthetic --scene ship
+
+Native viewer for trained 2DTS models and ordinary triangle meshes. Run commands
+from the repository root with the `2DTS` environment activated.
+
+```powershell
+python -m pip install "moderngl==5.12.0" "glcontext==3.0.0" "glfw==2.10.2" "imgui-bundle==1.92.900" "PyOpenGL==3.1.10"
+python -m py_viewer.viwer --model outputs/baselines/lego_20260921_135232/mesh/ckpt/60000.ckpt
 ```
 
-Then, open your web browser and navigate to `http://localhost:8080` to view the rendered scene. If you are running the viewer on a remote server, make sure to set up port forwarding or access the server's IP address directly.
+The Lego baseline's `mesh.yaml` and NeRF camera directory are detected
+automatically. For another checkpoint, supply its training configuration:
+
+```powershell
+python -m py_viewer.viwer --model path/to/model.ckpt --config path/to/config.yaml --cameras data/nerf_synthetic/lego
+```
+
+Start with `python -m py_viewer.viwer` to open an empty window. Enter a file path and
+press **Open**, or drop a file into the window. Multiple `--model` paths populate
+the **Model** selector; only the selected model is loaded.
+
+```powershell
+python -m py_viewer.viwer --model outputs/baselines/lego_20260921_135232/mesh/ckpt/60000.ckpt outputs/baselines/lego_20260921_135232/mesh/glb/60000.glb
+```
+
+The Python source is organized into three files:
+
+| File | Responsibility |
+| --- | --- |
+| `py_viewer/scene.py` | Settings, camera geometry, NeRF viewpoints and mesh loading |
+| `py_viewer/render.py` | OpenGL resources and the existing CUDA renderer adapter |
+| `py_viewer/viwer.py` | Window, controls, event loop and command-line entrypoint |
+
+GLSL sources are stored separately in `py_viewer/shaders/`: `image.vert`,
+`image.frag`, `mesh.vert`, and `mesh.frag`. Renderers load them relative to
+`render.py`, independently of the working directory, when creating a GL program.
+
+The entrypoint is now `python -m py_viewer.viwer`; the former package-level
+`python -m py_viewer` entrypoint was removed. Viewer dependencies are optional;
+NumPy, SciPy, trimesh, Pillow, PyYAML and plyfile come from the `2DTS` environment.
+
+#### Controls
+
+| Action | Control |
+| --- | --- |
+| Orbit | Left drag on the viewport |
+| Pan | Right or middle drag |
+| Dolly | Mouse wheel |
+| Fit the model | **F** or **Fit model** |
+| Dataset viewpoint | **Camera**, then **View** |
+| Save displayed image | **Save viewport PNG**; defaults to `outputs/viewer/` |
+
+Camera navigation switches a dataset camera to **Free**. GT remains tied to its
+dataset viewpoint. Dataset image aspect ratios are preserved when resizing the
+window. **Resolution** sets the longest image dimension, independently of the
+window size. The renderer reuses the last image until the scene or view changes.
+
+#### Rendering contracts
+
+| Input | Rendering |
+| --- | --- |
+| 2DTS `.ckpt` | Existing CUDA renderer; runtime SH degree, gamma and opacity floor restored from the checkpoint, remaining settings from its YAML |
+| 2DTS custom `.ply` | Existing CUDA renderer; SH layout inferred from the file, runtime settings inferred from YAML schedules and a numeric iteration filename |
+| Indexed `.ply`, `.obj`, `.glb`, `.gltf` | ModernGL triangles; scene transforms, vertex/face colors and base-color textures |
+
+Custom PLY files are distinguished by their triangle-coordinate and opacity
+properties, not just their extension. PLY does not contain the full checkpoint
+runtime state; check its displayed settings when the configuration or iteration
+is unavailable. A checkpoint and its YAML are preferable for baseline comparison.
+View-specific color-affine correction is disabled for arbitrary-view rendering.
+
+2DTS provides RGB, Depth, Normal and Alpha modes, gamma/SH/sorting/opacity controls,
+backface culling and supersampling. Depth is a min/max visualization of the
+CUDA renderer's accumulated depth, including background depth; it is not a metric
+depth export. Normals are the accumulated normals transformed to world coordinates
+and mapped to RGB, without replacing them with unit surface normals. Alpha is the
+renderer's coverage output. GT uses the selected image and current background.
+
+The mesh path is an **opaque, unlit base-color preview**, with world-space flat
+normals and wireframe. It does not implement PBR lighting, material alpha blending,
+skinning or animation playback. It does not aim to match CUDA splat compositing.
+The camera loader supports NeRF/Blender `transforms_*.json`; other dataset camera
+formats can still be viewed with the free camera but need a separate preset loader.
+
+2DTS requires the project's working PyTorch/CUDA extensions. Ordinary mesh
+rendering and `--help` do not import Torch. The CUDA image currently crosses CPU
+memory before its OpenGL upload; CUDA/OpenGL zero-copy interop is not implemented.
+**Render call** is CPU wall time for the render call, not a GPU timer or FPS measure.
+
+#### Verification
+
+Check dependencies and the command-line entrypoint without opening a window:
+
+```powershell
+python -m pip check
+python -m py_viewer.viwer --help
+```
+
+Bounded command-line rendering:
+
+```powershell
+python -m py_viewer.viwer --model outputs/baselines/lego_20260921_135232/mesh/ckpt/60000.ckpt --headless --frames 3 --screenshot outputs/viewer/lego.png --report outputs/viewer/lego.json
+```
+
+`--headless` means a hidden GLFW window; a working desktop OpenGL driver is still
+required. Snapshots contain the rendered viewport, with RGB uint8 conversion
+performed once by the framebuffer. The bounded run closes the window it creates.
+
+The legacy [Viser viewer][3] remains in `viser_viewer.py` and requires Viser,
+which is excluded from `environment.yml`.
 
 ## - Notes
 We provided two distinct training configurations: VanillaTS and VanillaTS_mesh.

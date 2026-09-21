@@ -46,7 +46,7 @@ class TriangleRenderer:
         color: torch.Tensor,
         opacity: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        # Create placeholder tensor to store gradients of the 2D (screen-space) center of each triangle.
+        # Collect per-triangle densification statistics through the custom backward pass.
         grad_holder = torch.zeros((vertex.shape[0]), device=vertex.device, dtype=vertex.dtype, requires_grad=True)
 
         output_tuple = self.rasterizer.forward(

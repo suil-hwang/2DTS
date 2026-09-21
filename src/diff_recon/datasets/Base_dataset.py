@@ -31,15 +31,16 @@ class BaseDatasetFactory(abc.ABC):
         if len(dataset) == 0:
             return []
 
+        num_workers = self._num_workers if num_workers is None else num_workers
         return iter(
             DataLoader(
                 dataset,
                 batch_size=None,
                 shuffle=shuffle,
-                num_workers=self._num_workers if num_workers is None else num_workers,
+                num_workers=num_workers,
                 pin_memory=True,
                 collate_fn=nop,  # can't use lambda x: x because of pickling error when using "spawn" start method
-                prefetch_factor=10,
+                prefetch_factor=10 if num_workers > 0 else None,
             )
         )
 

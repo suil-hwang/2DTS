@@ -236,7 +236,6 @@ class TSTrainer:
 
     def _optimize(self, iteration: int, render_pkg: dict):
         bs = self.config.trainer.batch_size if self.config.trainer.batch_size is not None else 1
-        psnr_threshold = self.config.model.densification.psnr_threshold if self.config.model.densification is not None else None
 
         render_pkg["grad"] = 0
         self.accum_loss.append(render_pkg["loss"])
@@ -245,10 +244,7 @@ class TSTrainer:
 
         total_loss = torch.sum(torch.stack(self.accum_loss))
         total_loss.backward()
-        if psnr_threshold is not None and "psnr" in render_pkg and render_pkg["psnr"] < psnr_threshold and bs == 1:
-            render_pkg["grad"] = None  # skip gradient accumulation if PSNR is too low
-        else:
-            render_pkg["grad"] = render_pkg["grad_holder"].grad
+        render_pkg["grad"] = render_pkg["grad_holder"].grad
 
         self.model.update_learning_rate(iteration)
         self.model.optimizer.step()
