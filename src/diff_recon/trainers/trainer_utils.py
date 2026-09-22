@@ -40,7 +40,7 @@ class GaussianSmoothing2D(nn.Module):
     def __init__(self, kernel_size: int, sigma: float, normalize: bool = True):
         super().__init__()
         self.kernel_size = kernel_size
-        self.kernel = self._gaussian_kernel(kernel_size, sigma, normalize)
+        self.register_buffer("kernel", self._gaussian_kernel(kernel_size, sigma, normalize), persistent=False)
         self.kernel_buffer = {}
 
     @staticmethod
@@ -64,10 +64,11 @@ class GaussianSmoothing2D(nn.Module):
             x (torch.Tensor): Tensor of shape (B, C, H, W)
         """
         channels = x.shape[1]
-        if channels not in self.kernel_buffer:
-            self.kernel_buffer[channels] = self.kernel.repeat(channels, 1, 1, 1).to(x.device)
+        key = (channels, x.device, x.dtype)
+        if key not in self.kernel_buffer:
+            self.kernel_buffer[key] = self.kernel.to(x).repeat(channels, 1, 1, 1)
 
-        kernel = self.kernel_buffer[channels].to(x.device)
+        kernel = self.kernel_buffer[key]
         padding = (self.kernel_size - 1) // 2
         return F.conv2d(x, kernel, padding=padding, groups=channels)
 
@@ -185,8 +186,8 @@ class DoGLoss(nn.Module):
 class ScharrFilter(nn.Module):
     def __init__(self):
         super().__init__()
-        self.kernel_x = torch.tensor([[-3, 0, 3], [-10, 0, 10], [-3, 0, 3]], dtype=torch.float32).view(1, 1, 3, 3) / 32
-        self.kernel_y = torch.tensor([[-3, -10, -3], [0, 0, 0], [3, 10, 3]], dtype=torch.float32).view(1, 1, 3, 3) / 32
+        self.register_buffer("kernel_x", torch.tensor([[-3, 0, 3], [-10, 0, 10], [-3, 0, 3]], dtype=torch.float32).view(1, 1, 3, 3) / 32, persistent=False)
+        self.register_buffer("kernel_y", torch.tensor([[-3, -10, -3], [0, 0, 0], [3, 10, 3]], dtype=torch.float32).view(1, 1, 3, 3) / 32, persistent=False)
         self.kernel_buffer = {}
 
     def forward(self, x: torch.Tensor, ret_norm=False) -> torch.Tensor:
@@ -195,13 +196,14 @@ class ScharrFilter(nn.Module):
             x (torch.Tensor): Tensor of shape (B, C, H, W)
         """
         channels = x.shape[1]
-        if channels not in self.kernel_buffer:
-            self.kernel_buffer[channels] = (
-                self.kernel_x.repeat(channels, 1, 1, 1).to(x.device),
-                self.kernel_y.repeat(channels, 1, 1, 1).to(x.device),
+        key = (channels, x.device, x.dtype)
+        if key not in self.kernel_buffer:
+            self.kernel_buffer[key] = (
+                self.kernel_x.to(x).repeat(channels, 1, 1, 1),
+                self.kernel_y.to(x).repeat(channels, 1, 1, 1),
             )
 
-        kernel_x, kernel_y = self.kernel_buffer[channels]
+        kernel_x, kernel_y = self.kernel_buffer[key]
         x_padded = F.pad(x, (1, 1, 1, 1), mode="replicate")
         grad_x = F.conv2d(x_padded, kernel_x, groups=channels)
         grad_y = F.conv2d(x_padded, kernel_y, groups=channels)
@@ -401,7 +403,8 @@ class ConsistencyLoss(nn.Module):
 
         # sample points from reference view and project back to current view
         xyz_ref = camera_ref.get_xyz_from_depth(depth_ref).unsqueeze(0).permute(0, 3, 1, 2)  # (1, 3, H, W)
-        xyz_ref_sampled = F.grid_sample(xyz_ref, xyz_proj[:, :2].view(1, -1, 1, 2), align_corners=False).view(-1, 3)  # (N, 3)
+        xyz_ref_sampled = F.grid_sample(xyz_ref, xyz_proj[:, :2].view(1, -1, 1, 2), align_corners=False)
+        xyz_ref_sampled = xyz_ref_sampled.squeeze(0).squeeze(-1).transpose(0, 1)  # (N, 3)
         xy_proj_back = camera.project_points(xyz_ref_sampled)[:, :2]  # (N, 2)
         pixels_back = (xy_proj_back + 1) * 0.5 * wh
 
@@ -430,7 +433,8 @@ class ConsistencyLoss(nn.Module):
 
         # project patch points to reference view
         xyz_img = camera.get_xyz_from_depth(depth).unsqueeze(0).permute(0, 3, 1, 2)  # (1, 3, H, W)
-        patch_xyz = F.grid_sample(xyz_img, pixel_patch.view(1, -1, 1, 2), align_corners=False).view(-1, 3)  # (N*K, 3)
+        patch_xyz = F.grid_sample(xyz_img, pixel_patch.view(1, -1, 1, 2), align_corners=False)
+        patch_xyz = patch_xyz.squeeze(0).squeeze(-1).transpose(0, 1)  # (N*K, 3)
         patch_proj = camera_ref.project_points(patch_xyz)[:, :2]  # (N*K, 2)
 
         # sample colors from reference view

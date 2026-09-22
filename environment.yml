@@ -5,29 +5,30 @@ channels:
 dependencies:
   - python=3.12
   - pip
-  - setuptools
+  - setuptools<82
   - wheel
   - packaging
   - ninja
+  - numpy
+  - opencv
+  - scipy
+  - scikit-image
+  - scikit-learn
+  - matplotlib
+  - cycler
+  - pillow
+  - plyfile
+  - pyyaml
+  - shapely
+  - tqdm
+  - trimesh
+  - igl
+  - open3d
+  - tensorboard
+  - oss2
   - pip:
-      - --extra-index-url https://download.pytorch.org/whl/cu130
-      - torch==2.14.0+cu130
-      - torchvision==0.29.0+cu130
-      - numpy
-      - opencv-python
-      - scipy
-      - scikit-image
-      - scikit-learn
-      - matplotlib
-      - cycler
-      - Pillow
-      - plyfile
-      - PyYAML
-      - Shapely
-      - tqdm
-      - trimesh
-      - libigl
-      - open3d
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.11.0+cu128
+      - torchvision==0.26.0+cu128
       - torchmetrics
-      - tensorboard
-      - oss2
+      - viser

@@ -104,35 +104,39 @@ __global__ void FORWARD::preprocessCUDA(
 	float3 v1_dilated_view = center_view + dilation * (v1_view - center_view);
 	float3 v2_dilated_view = center_view + dilation * (v2_view - center_view);
 	float3 v3_dilated_view = center_view + dilation * (v3_view - center_view);
-	// Pixel intersections accept every positive view-space depth. Projected
-	// near-plane z therefore cannot be used to discard otherwise visible support.
-	if (v1_dilated_view.z <= 0 && v2_dilated_view.z <= 0 && v3_dilated_view.z <= 0)
+	float3 v1_dilated_proj = projectPoint(v1_dilated_view, projmatrix);
+	float3 v2_dilated_proj = projectPoint(v2_dilated_view, projmatrix);
+	float3 v3_dilated_proj = projectPoint(v3_dilated_view, projmatrix);
+
+	if (v1_dilated_proj.z <= 0 && v2_dilated_proj.z <= 0 && v3_dilated_proj.z <= 0) // Near culling
 		return;
 
-	// This orientation test remains valid when support crosses the camera plane.
-	if (back_culling && dot(normal_view, center_view) >= 0)
+	// render triangles that extend behind the camera properly
+	if (v1_dilated_view.z <= EPS)
+	{
+		v1_dilated_view.z = 0.001f;
+		v1_dilated_proj = projectPoint(v1_dilated_view, projmatrix);
+	}
+	if (v2_dilated_view.z <= EPS)
+	{
+		v2_dilated_view.z = 0.001f;
+		v2_dilated_proj = projectPoint(v2_dilated_view, projmatrix);
+	}
+	if (v3_dilated_view.z <= EPS)
+	{
+		v3_dilated_view.z = 0.001f;
+		v3_dilated_proj = projectPoint(v3_dilated_view, projmatrix);
+	}
+
+	if (back_culling && cross(v2_dilated_proj - v1_dilated_proj, v3_dilated_proj - v1_dilated_proj).z >= 0) // Back-face culling
 		return;
 
-	float2 v_min, v_max;
-	if (v1_dilated_view.z <= EPS || v2_dilated_view.z <= EPS || v3_dilated_view.z <= EPS)
-	{
-		// Merely clamping a vertex z changes the projected edges and can remove
-		// valid pixels. A full-image rectangle is conservative; pixel evaluation
-		// still uses the original triangle and its original finite support.
-		v_min = make_float2(-0.5f, -0.5f);
-		v_max = make_float2(W - 0.5f, H - 0.5f);
-	}
-	else
-	{
-		const float3 v1_dilated_proj = projectPoint(v1_dilated_view, projmatrix);
-		const float3 v2_dilated_proj = projectPoint(v2_dilated_view, projmatrix);
-		const float3 v3_dilated_proj = projectPoint(v3_dilated_view, projmatrix);
-		const float2 v1_dilated_2D = {projToPix(v1_dilated_proj.x, W), projToPix(v1_dilated_proj.y, H)};
-		const float2 v2_dilated_2D = {projToPix(v2_dilated_proj.x, W), projToPix(v2_dilated_proj.y, H)};
-		const float2 v3_dilated_2D = {projToPix(v3_dilated_proj.x, W), projToPix(v3_dilated_proj.y, H)};
-		v_min = min(v1_dilated_2D, v2_dilated_2D, v3_dilated_2D);
-		v_max = max(v1_dilated_2D, v2_dilated_2D, v3_dilated_2D);
-	}
+	const float2 v1_dilated_2D = {projToPix(v1_dilated_proj.x, W), projToPix(v1_dilated_proj.y, H)};
+	const float2 v2_dilated_2D = {projToPix(v2_dilated_proj.x, W), projToPix(v2_dilated_proj.y, H)};
+	const float2 v3_dilated_2D = {projToPix(v3_dilated_proj.x, W), projToPix(v3_dilated_proj.y, H)};
+
+	float2 v_min = min(v1_dilated_2D, v2_dilated_2D, v3_dilated_2D);
+	float2 v_max = max(v1_dilated_2D, v2_dilated_2D, v3_dilated_2D);
 	if (v_min.x >= ((float)W - 0.5f) || v_min.y >= ((float)H - 0.5f) || v_max.x < -0.5f || v_max.y < -0.5f)
 		return;
 	v_min = {min(max(v_min.x, -0.5f), (float)W - 0.5f), min(max(v_min.y, -0.5f), (float)H - 0.5f)};

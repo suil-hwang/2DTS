@@ -11,7 +11,6 @@
 #include <string>
 #include <functional>
 #include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
 
 #include "extension_interface.h"
 #include "rasterizer.h"
@@ -46,7 +45,7 @@ rasterizeTrianglesForward(
 	const bool use_vertex_color = use_shs ? shs.ndimension() == 4 : feature.ndimension() == 3;
 	const int C = use_shs ? 3 : (use_vertex_color ? feature.size(2) : feature.size(1));
 	int M = 0;
-	if (use_shs)
+	if (shs.size(0) != 0)
 	{
 		M = use_vertex_color ? shs.size(2) : shs.size(1);
 	}
@@ -155,17 +154,7 @@ rasterizeTrianglesForward(
 			back_culling,
 			rich_info,
 			sort_level,
-			debug,
-			c10::cuda::getCurrentCUDAStream(vertex.get_device()).stream());
-	}
-	else
-	{
-		out_feature.copy_(background.view({C, 1, 1}).expand({C, H, W}));
-		if (rich_info)
-		{
-			depth.fill_(background_depth);
-			final_Ts.fill_(1.0f);
-		}
+			debug);
 	}
 
 	return std::make_tuple(
@@ -212,7 +201,6 @@ rasterizeTrianglesBackward(
 	const torch::Tensor &dL_dout_depth,
 	const torch::Tensor &dL_dout_normal,
 	const torch::Tensor &dL_dout_distortion,
-	const torch::Tensor &dL_dout_alpha_mask,
 	const bool back_culling,
 	const bool rich_info,
 	const int sort_level,
@@ -225,7 +213,7 @@ rasterizeTrianglesBackward(
 	const bool use_vertex_color = use_shs ? shs.ndimension() == 4 : feature.ndimension() == 3;
 	const int C = use_shs ? 3 : (use_vertex_color ? feature.size(2) : feature.size(1));
 	int M = 0;
-	if (use_shs)
+	if (shs.size(0) != 0)
 	{
 		M = use_vertex_color ? shs.size(2) : shs.size(1);
 	}
@@ -234,7 +222,8 @@ rasterizeTrianglesBackward(
 	if (!(viewmatrix.is_contiguous() && projmatrix.is_contiguous() && campos.is_contiguous() &&
 		  background.is_contiguous() && vertex.is_contiguous() && shs.is_contiguous() && feature.is_contiguous() && opacity.is_contiguous() &&
 		  radii.is_contiguous() && final_feature.is_contiguous() && final_depth.is_contiguous() && final_normal.is_contiguous() && final_distortion.is_contiguous() &&
-		  geometryBuffer.is_contiguous() && binningBuffer.is_contiguous() && imageBuffer.is_contiguous()))
+		  geometryBuffer.is_contiguous() && binningBuffer.is_contiguous() && imageBuffer.is_contiguous() &&
+		  dL_dout_feature.is_contiguous() && dL_dout_depth.is_contiguous() && dL_dout_normal.is_contiguous()))
 	{
 		AT_ERROR("input tensors must be contiguous"); // make sure input tensors are contiguous to avoid memory copy and intermediate variables
 	}
@@ -266,18 +255,11 @@ rasterizeTrianglesBackward(
 		binningBuffer,
 		imageBuffer};
 
-	// Keep any copies alive until the kernels have been enqueued on their stream.
-	const auto grad_feature = dL_dout_feature.contiguous();
-	const auto grad_depth = dL_dout_depth.contiguous();
-	const auto grad_normal = dL_dout_normal.contiguous();
-	const auto grad_distortion = dL_dout_distortion.contiguous();
-	const auto grad_alpha_mask = dL_dout_alpha_mask.contiguous();
 	Params::LossInput lossInput = {
-		grad_feature.data_ptr<float>(),
-		grad_depth.data_ptr<float>(),
-		grad_normal.data_ptr<float>(),
-		grad_distortion.data_ptr<float>(),
-		grad_alpha_mask.data_ptr<float>()};
+		dL_dout_feature.contiguous().data_ptr<float>(),
+		dL_dout_depth.contiguous().data_ptr<float>(),
+		dL_dout_normal.contiguous().data_ptr<float>(),
+		dL_dout_distortion.contiguous().data_ptr<float>()};
 
 	torch::Tensor dL_dvertex = torch::zeros({P, 3, 3}, vertex.options());
 	torch::Tensor dL_dv_norm = torch::zeros({P}, vertex.options());
@@ -303,8 +285,7 @@ rasterizeTrianglesBackward(
 			back_culling,
 			rich_info,
 			sort_level,
-			debug,
-			c10::cuda::getCurrentCUDAStream(vertex.get_device()).stream());
+			debug);
 	}
 
 	return std::make_tuple(

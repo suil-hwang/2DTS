@@ -59,6 +59,9 @@ class TriangleRenderer:
 
         if self.rasterizer.raster_settings.rich_info:
             rendered_image, radii, depth, normal, distortion, contrib_sum, contrib_max, n_contribs, alpha_mask, num_rendered = output_tuple
+            for output in (rendered_image, depth, normal, distortion):
+                if output.requires_grad:
+                    output.register_hook(lambda grad: grad.contiguous() if grad is not None else None)
             output_pkg = {
                 "render": rendered_image,
                 "radii": radii,

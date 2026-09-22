@@ -61,7 +61,6 @@ rasterizeTrianglesBackward(
 	const torch::Tensor &dL_dout_depth,
 	const torch::Tensor &dL_dout_normal,
 	const torch::Tensor &dL_dout_distortion,
-	const torch::Tensor &dL_dout_alpha_mask,
 	// control flags
 	const bool back_culling,
 	const bool rich_info,

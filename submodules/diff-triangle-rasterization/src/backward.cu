@@ -201,12 +201,10 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		const float *__restrict__ final_Ts,
 		const uint32_t *__restrict__ n_contribs,
 		const float *__restrict__ depth_image,
-		const float *__restrict__ distortion_image,
 		const float *__restrict__ dL_dout_feature,
 		const float *__restrict__ dL_dout_depth,
 		const float *__restrict__ dL_dout_normal,
 		const float *__restrict__ dL_dout_distortion,
-		const float *__restrict__ dL_dout_alpha_mask,
 		float3 *__restrict__ dL_dv1_view,
 		float3 *__restrict__ dL_dv2_view,
 		float3 *__restrict__ dL_dv3_view,
@@ -251,10 +249,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	float3 dL_dnormal_pixel = {0, 0, 0};
 	float dL_ddepth_pixel = 0;
 	float dL_ddistortion_pixel = 0;
-	float dL_dalpha_mask_pixel = 0;
 	float depth_pixel = 0;
-	const float total_opacity = 1.0f - final_T;
-	float distortion_per_opacity = 0;
 
 	if (inside)
 	{
@@ -267,13 +262,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		{
 			dL_dnormal_pixel = make_float3(dL_dout_normal[pix_id], dL_dout_normal[W * H + pix_id], dL_dout_normal[2 * W * H + pix_id]);
 			dL_ddepth_pixel = dL_dout_depth[pix_id];
-			dL_ddistortion_pixel = dL_dout_distortion[pix_id];
-			dL_dalpha_mask_pixel = dL_dout_alpha_mask[pix_id];
-			if (total_opacity > 0.0f)
-			{
-				depth_pixel = (depth_image[pix_id] - final_T * background_depth) / total_opacity;
-				distortion_per_opacity = distortion_image[pix_id] / total_opacity;
-			}
+			dL_ddistortion_pixel = dL_dout_distortion[pix_id] * (1.0f - final_T);
+			depth_pixel = (depth_image[pix_id] - final_T * background_depth) / (1.0f - final_T + EPS);
 		}
 	}
 
@@ -385,19 +375,15 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 				dL_dcontrib += dL_ddepth_pixel * (depth - accum_depth);
 				accum_depth = alpha * depth + (1.0f - alpha) * accum_depth;
 
-				// D = sum_{i<j} w_i w_j (z_i-z_j)^2. Its weight derivative
-				// includes D/A because total opacity A also depends on the weights.
-				const float distort = total_opacity * (depth - depth_pixel) * (depth - depth_pixel) + distortion_per_opacity;
-				dL_ddepth += dL_ddistortion_pixel * contrib * 2.0f * total_opacity * (depth - depth_pixel);
+				const float distort = (depth - depth_pixel) * (depth - depth_pixel);
+				dL_ddepth += dL_ddistortion_pixel * contrib * 2.0f * (depth - depth_pixel);
 				dL_dcontrib += dL_ddistortion_pixel * (distort - accum_distort);
 				accum_distort = alpha * distort + (1.0f - alpha) * accum_distort;
 			}
 
-			const float dL_dalpha = dL_dcontrib * T + dL_dalpha_mask_pixel * final_T / (1.0f - alpha);
+			const float dL_dalpha = dL_dcontrib * T;
 			const float dL_dpower = (op * G < ALPHA_THRES) ? (dL_dalpha * alpha) : 0.0f; // if not clamped by min(0.99, op * G)
-			// At the center choose zero; away from it use the exact derivative.
-			const float dpower_decc = ecc > 0.0f ? -gamma * pow(ecc, 2.0f * gamma - 1.0f) : 0.0f;
-			const float dL_decc = dL_dpower * dpower_decc;
+			const float dL_decc = dL_dpower * 2 * gamma * power / (ecc + EPS);
 
 			float3 decc_da = {0, 0, 0};
 			if (a1 <= a2 && a1 <= a3)
@@ -466,7 +452,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			atomicAdd(&dL_dv_norm[global_id], dL_dv_norm_point);
 
 			// Update gradients w.r.t. triangle opacity
-			atomicAdd(&dL_dopacity[global_id], (op * G < ALPHA_THRES) ? dL_dalpha * G : 0.0f);
+			atomicAdd(&dL_dopacity[global_id], dL_dalpha * G);
 		}
 	}
 }
@@ -503,7 +489,6 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		const float *__restrict__ dL_dout_depth,
 		const float *__restrict__ dL_dout_normal,
 		const float *__restrict__ dL_dout_distortion,
-		const float *__restrict__ dL_dout_alpha_mask,
 		float3 *__restrict__ dL_dv1_view,
 		float3 *__restrict__ dL_dv2_view,
 		float3 *__restrict__ dL_dv3_view,
@@ -541,15 +526,12 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	float final_depth = 0;					 // Final depth for this pixel
 	float final_depth_accum = 0;			 // Final depth for this pixel (without background)
 	float final_distort = 0;				 // Final distortion for this pixel
-	const float total_opacity = 1.0f - final_T;
-	float distortion_per_opacity = 0;
 
 	// Gradients of loss w.r.t. pixel outputs
 	float dL_dfeature_pixel[MAX_CHANNELS] = {0};
 	float3 dL_dnormal_pixel = {0, 0, 0};
 	float dL_ddepth_pixel = 0;
 	float dL_ddistortion_pixel = 0;
-	float dL_dalpha_mask_pixel = 0;
 
 	if (inside)
 	{
@@ -561,17 +543,12 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		if (rich_info)
 		{
 			final_depth = final_depths[pix_id];
-			if (total_opacity > 0.0f)
-			{
-				final_depth_accum = (final_depth - final_T * background_depth) / total_opacity;
-				distortion_per_opacity = final_distorts[pix_id] / total_opacity;
-			}
+			final_depth_accum = (final_depth - final_T * background_depth) / (1.0f - final_T + EPS);
 			final_normal = make_float3(final_normals[pix_id], final_normals[W * H + pix_id], final_normals[2 * W * H + pix_id]);
 			final_distort = final_distorts[pix_id];
 			dL_dnormal_pixel = make_float3(dL_dout_normal[pix_id], dL_dout_normal[W * H + pix_id], dL_dout_normal[2 * W * H + pix_id]);
 			dL_ddepth_pixel = dL_dout_depth[pix_id];
-			dL_ddistortion_pixel = dL_dout_distortion[pix_id];
-			dL_dalpha_mask_pixel = dL_dout_alpha_mask[pix_id];
+			dL_ddistortion_pixel = dL_dout_distortion[pix_id] * (1.0f - final_T);
 		}
 	}
 
@@ -615,8 +592,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		const float test_T = T * (1.0f - alpha);
 
 		const float dalpha_dpower = (op * G < ALPHA_THRES) ? alpha : 0.0f; // if not clamped by min(0.99, op * G)
-		const float dpower_decc = ecc > 0.0f ? -gamma * pow(ecc, 2.0f * gamma - 1.0f) : 0.0f;
-		const float dalpha_decc = dalpha_dpower * dpower_decc;
+		const float dalpha_decc = dalpha_dpower * 2 * gamma * power / (ecc + EPS);
 
 		// Propagate gradients to per-triangle parameters
 		float dL_dcontrib = 0.0f;
@@ -658,13 +634,12 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			
 			accum_normal += normal * contrib;
 			accum_depth += depth * contrib;
-			const float distort = total_opacity * (depth - final_depth_accum) * (depth - final_depth_accum) + distortion_per_opacity;
+			const float distort = (depth - final_depth_accum) * (depth - final_depth_accum);
 			accum_distort += distort * contrib;
 
 			const float3 accum_normal_back = (final_normal - accum_normal) / test_T;   // accumulated normal coming after
 			const float accum_depth_back = (final_depth - accum_depth) / test_T;	   // accumulated depth coming after
-			// sum_i w_i * (dD/dw_i) = 2D, including the opacity derivative.
-			const float accum_distort_back = (2.0f * final_distort - accum_distort) / test_T;
+			const float accum_distort_back = (final_distort - accum_distort) / test_T; // accumulated distortion coming after
 
 			dL_dnormal += dnormvdv(normal_view, dL_dnormal_pixel * contrib); // dnormvdv expects unnormalized input
 			dL_dcontrib += dot(dL_dnormal_pixel, normal - accum_normal_back);
@@ -672,11 +647,11 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			dL_ddepth += dL_ddepth_pixel * contrib;
 			dL_dcontrib += dL_ddepth_pixel * (depth - accum_depth_back);
 
-			dL_ddepth += dL_ddistortion_pixel * contrib * 2.0f * total_opacity * (depth - final_depth_accum);
+			dL_ddepth += dL_ddistortion_pixel * contrib * 2.0f * (depth - final_depth_accum);
 			dL_dcontrib += dL_ddistortion_pixel * (distort - accum_distort_back);
 		}
 
-		const float dL_dalpha = dL_dcontrib * T + dL_dalpha_mask_pixel * final_T / (1.0f - alpha);
+		const float dL_dalpha = dL_dcontrib * T;
 		const float dL_decc = dL_dalpha * dalpha_decc;
 		const float inv_p_ray_dot_n = 1.0f / dot(p_ray, normal_view);
 
@@ -753,7 +728,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		atomicAdd(&dL_dv_norm[global_id], dL_dv_norm_point);
 
 		// Update gradients w.r.t. triangle opacity
-		atomicAdd(&dL_dopacity[global_id], (op * G < ALPHA_THRES) ? dL_dalpha * G : 0.0f);
+		atomicAdd(&dL_dopacity[global_id], dL_dalpha * G);
 
 		T *= (1.0f - alpha);
 		if (T <= T_THRES)

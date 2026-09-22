@@ -83,6 +83,7 @@ class TSTrainer:
             dilation = self.config.trainer.consistency_loss.dilation
             self.consistencyLoss = ConsistencyLoss(error_thres=error_thres, n_sample=n_sample, patch_size=patch_size, dilation=dilation)
         self._nearest_indices_cache = None
+        self._nearest_vertex = None
 
         self.accum_loss = []
 
@@ -208,8 +209,13 @@ class TSTrainer:
 
         vertex_reg = 0
         if w_vertex_reg > 0:
-            if (iteration - 1) % config.vertex_reg.interval_iter == 0 or self._nearest_indices_cache is None:
+            if (
+                (iteration - 1) % config.vertex_reg.interval_iter == 0
+                or self._nearest_indices_cache is None
+                or vertex is not self._nearest_vertex
+            ):
                 self._nearest_indices_cache = nearest_neighbor(vertex.view(-1, 3), 3)
+                self._nearest_vertex = vertex
             vertex_reg = nearest_dist2(vertex.view(-1, 3), self._nearest_indices_cache).mean()
 
         # Combine losses
