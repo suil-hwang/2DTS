@@ -9,6 +9,7 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <c10/cuda/CUDAStream.h>
 namespace cg = cooperative_groups;
 
 #include "rasterizer.h"
@@ -238,7 +239,6 @@ __global__ void duplicateWithKeysPerTileDepth(
 
 	uint2 cur_rect_min = rect_min[idx];
 	uint2 cur_rect_max = rect_max[idx];
-	float cur_depth = depth[idx];
 	uint32_t cur_offset = (idx == 0) ? 0 : offsets[idx - 1];
 
 	const float3 v1_view = s_v1_view[idx];
@@ -247,22 +247,21 @@ __global__ void duplicateWithKeysPerTileDepth(
 	const float3 normal_view = s_normal_view[idx];
 	const float3 center_view = (v1_view + v2_view + v3_view) / 3.0f;
 
-	const float3 v1_view_clip = make_float3(v1_view.x, v1_view.y, max(v1_view.z, 0.001f));
-	const float3 v2_view_clip = make_float3(v2_view.x, v2_view.y, max(v2_view.z, 0.001f));
-	const float3 v3_view_clip = make_float3(v3_view.x, v3_view.y, max(v3_view.z, 0.001f));
-	const float3 center_view_clip = make_float3(center_view.x, center_view.y, max(center_view.z, 0.001f));
+	const float ecc_thres = pow(-2.0f * log(G_THRES), 0.5f / gamma);
+	const bool crosses_camera =
+		center_view.z + ecc_thres * (v1_view.z - center_view.z) <= EPS ||
+		center_view.z + ecc_thres * (v2_view.z - center_view.z) <= EPS ||
+		center_view.z + ecc_thres * (v3_view.z - center_view.z) <= EPS;
 
-	const float3 v1_proj = projectPoint(v1_view_clip, projmatrix);
-	const float3 v2_proj = projectPoint(v2_view_clip, projmatrix);
-	const float3 v3_proj = projectPoint(v3_view_clip, projmatrix);
-	const float3 center_proj = projectPoint(center_view_clip, projmatrix);
+	const float3 v1_proj = projectPoint(v1_view, projmatrix);
+	const float3 v2_proj = projectPoint(v2_view, projmatrix);
+	const float3 v3_proj = projectPoint(v3_view, projmatrix);
+	const float3 center_proj = projectPoint(center_view, projmatrix);
 
 	const float2 v1_2D = {projToPix(v1_proj.x, W), projToPix(v1_proj.y, H)};
 	const float2 v2_2D = {projToPix(v2_proj.x, W), projToPix(v2_proj.y, H)};
 	const float2 v3_2D = {projToPix(v3_proj.x, W), projToPix(v3_proj.y, H)};
 	const float2 center_2D = {projToPix(center_proj.x, W), projToPix(center_proj.y, H)};
-
-	const float ecc_thres = pow(-2.0f * log(G_THRES), 0.5f / gamma);
 
 	// For each tile that the bounding rect overlaps, emit a key/value pair.
 	// The key is | tile ID | depth |, and the value is the ID of the triangle.
@@ -272,9 +271,11 @@ __global__ void duplicateWithKeysPerTileDepth(
 	{
 		for (int x = cur_rect_min.x; x < cur_rect_max.x; x++)
 		{
+			float cur_depth = depth[idx];
 			const float2 bbox_min = make_float2(x * BLOCK_X - 0.5f, y * BLOCK_Y - 0.5f);
 			const float2 bbox_max = make_float2(min((x + 1) * BLOCK_X - 0.5f, W - 0.5f), min((y + 1) * BLOCK_Y - 0.5f, H - 0.5f));
-			const float lowest_ecc = getLowestEcc(W, H, tan_fovx, tan_fovy, v1_view, v2_view, v3_view, normal_view, v1_2D, v2_2D, v3_2D, center_2D, bbox_min, bbox_max, cur_depth);
+			// Projected edges are not a conservative culling bound across the camera plane.
+			const float lowest_ecc = crosses_camera ? 0.0f : getLowestEcc(W, H, tan_fovx, tan_fovy, v1_view, v2_view, v3_view, normal_view, v1_2D, v2_2D, v3_2D, center_2D, bbox_min, bbox_max, cur_depth);
 			cur_depth = max(cur_depth, 0.0f);
 
 			uint64_t key = lowest_ecc < ecc_thres ? (y * grid.x + x) : (grid.x * grid.y); // use an invalid tile ID to indicate ignored tile
@@ -364,13 +365,14 @@ void Rasterizer::forward(
 	const int W = cameraInfo.width;
 	const int H = cameraInfo.height;
 	const int P = geometryInfo.P;
+	const cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
 	const dim3 grid((W + BLOCK_X - 1) / BLOCK_X, (H + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);
 
 	Params::GeometryState geometryState(forwardOutput.geometryBuffer, (size_t)P, true, geometryInfo.use_vertex_color);
 
-	FORWARD::preprocessCUDA<<<(P + 255) / 256, 256>>>(
+	FORWARD::preprocessCUDA<<<(P + 255) / 256, 256, 0, stream>>>(
 		W, H, P, geometryInfo.D, geometryInfo.M, geometryInfo.gamma, rich_info,
 		geometryInfo.use_shs, geometryInfo.use_vertex_color, back_culling, grid,
 		cameraInfo.viewmatrix,
@@ -400,15 +402,24 @@ void Rasterizer::forward(
 	int radii;
 	for (int i = 0; i < P; i++)
 	{
-		cudaMemcpy(&v1, geometryInfo.vertex + 9 * i, sizeof(float3), cudaMemcpyDeviceToHost);
-		cudaMemcpy(&v2, geometryInfo.vertex + 9 * i + 3, sizeof(float3), cudaMemcpyDeviceToHost);
-		cudaMemcpy(&v3, geometryInfo.vertex + 9 * i + 6, sizeof(float3), cudaMemcpyDeviceToHost);
-		cudaMemcpy(&v1_view, geometryState.v1_view + i, sizeof(float3), cudaMemcpyDeviceToHost);
-		cudaMemcpy(&v2_view, geometryState.v2_view + i, sizeof(float3), cudaMemcpyDeviceToHost);
-		cudaMemcpy(&v3_view, geometryState.v3_view + i, sizeof(float3), cudaMemcpyDeviceToHost);
-		cudaMemcpy(&rect_min, geometryState.rect_min + i, sizeof(uint2), cudaMemcpyDeviceToHost);
-		cudaMemcpy(&rect_max, geometryState.rect_max + i, sizeof(uint2), cudaMemcpyDeviceToHost);
-		cudaMemcpy(&radii, forwardOutput.radii + i, sizeof(int), cudaMemcpyDeviceToHost);
+		cudaMemcpyAsync(&v1, geometryInfo.vertex + 9 * i, sizeof(float3), cudaMemcpyDeviceToHost, stream);
+		cudaStreamSynchronize(stream);
+		cudaMemcpyAsync(&v2, geometryInfo.vertex + 9 * i + 3, sizeof(float3), cudaMemcpyDeviceToHost, stream);
+		cudaStreamSynchronize(stream);
+		cudaMemcpyAsync(&v3, geometryInfo.vertex + 9 * i + 6, sizeof(float3), cudaMemcpyDeviceToHost, stream);
+		cudaStreamSynchronize(stream);
+		cudaMemcpyAsync(&v1_view, geometryState.v1_view + i, sizeof(float3), cudaMemcpyDeviceToHost, stream);
+		cudaStreamSynchronize(stream);
+		cudaMemcpyAsync(&v2_view, geometryState.v2_view + i, sizeof(float3), cudaMemcpyDeviceToHost, stream);
+		cudaStreamSynchronize(stream);
+		cudaMemcpyAsync(&v3_view, geometryState.v3_view + i, sizeof(float3), cudaMemcpyDeviceToHost, stream);
+		cudaStreamSynchronize(stream);
+		cudaMemcpyAsync(&rect_min, geometryState.rect_min + i, sizeof(uint2), cudaMemcpyDeviceToHost, stream);
+		cudaStreamSynchronize(stream);
+		cudaMemcpyAsync(&rect_max, geometryState.rect_max + i, sizeof(uint2), cudaMemcpyDeviceToHost, stream);
+		cudaStreamSynchronize(stream);
+		cudaMemcpyAsync(&radii, forwardOutput.radii + i, sizeof(int), cudaMemcpyDeviceToHost, stream);
+		cudaStreamSynchronize(stream);
 		std::cout << "P: " << i << ", ";
 		std::cout << "v1: [" << v1.x << ", " << v1.y << ", " << v1.z << "], ";
 		std::cout << "v2: [" << v2.x << ", " << v2.y << ", " << v2.z << "], ";
@@ -424,12 +435,13 @@ void Rasterizer::forward(
 
 	// Compute prefix sum over full list of touched tile counts.
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
-	cub::DeviceScan::InclusiveSum(geometryState.scanning_space, geometryState.scan_size, geometryState.tiles_touched, geometryState.point_offsets, P);
+	cub::DeviceScan::InclusiveSum(geometryState.scanning_space, geometryState.scan_size, geometryState.tiles_touched, geometryState.point_offsets, P, stream);
 	CHECK_CUDA(debug);
 
 	// Retrieve total number of triangle instances to launch and resize aux buffers
 	int num_rendered;
-	cudaMemcpy(&num_rendered, geometryState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost);
+	cudaMemcpyAsync(&num_rendered, geometryState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost, stream);
+	cudaStreamSynchronize(stream); // The host needs this count before allocating binning buffers.
 	CHECK_CUDA(debug);
 	forwardOutput.num_rendered = num_rendered;
 
@@ -439,7 +451,7 @@ void Rasterizer::forward(
 	// and corresponding dublicated triangle indices to be sorted
 	if (sort_level == 0)
 	{
-		duplicateWithKeys<<<(P + 255) / 256, 256>>>(
+		duplicateWithKeys<<<(P + 255) / 256, 256, 0, stream>>>(
 			P, grid,
 			geometryState.tiles_touched,
 			geometryState.rect_min,
@@ -451,7 +463,7 @@ void Rasterizer::forward(
 	}
 	else
 	{
-		duplicateWithKeysPerTileDepth<<<(P + 255) / 256, 256>>>(
+		duplicateWithKeysPerTileDepth<<<(P + 255) / 256, 256, 0, stream>>>(
 			P, grid, W, H, cameraInfo.tan_fovx, cameraInfo.tan_fovy, geometryInfo.gamma,
 			geometryState.tiles_touched,
 			geometryState.rect_min,
@@ -476,18 +488,18 @@ void Rasterizer::forward(
 		binningState.point_list_keys,
 		binningState.point_list_unsorted,
 		binningState.point_list,
-		num_rendered, 0, 32 + bit);
+		num_rendered, 0, 32 + bit, stream);
 	CHECK_CUDA(debug);
 
 	Params::ImageState imageState(forwardOutput.imageBuffer, (size_t)(W * H), true);
 
-	cudaMemset(imageState.ranges, 0, (grid.x * grid.y + 1) * sizeof(uint2));
+	cudaMemsetAsync(imageState.ranges, 0, (grid.x * grid.y + 1) * sizeof(uint2), stream);
 	CHECK_CUDA(debug);
 
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
 	{
-		identifyTileRanges<<<(num_rendered + 255) / 256, 256>>>(num_rendered, binningState.point_list_keys, imageState.ranges);
+		identifyTileRanges<<<(num_rendered + 255) / 256, 256, 0, stream>>>(num_rendered, binningState.point_list_keys, imageState.ranges);
 		CHECK_CUDA(debug);
 	}
 
@@ -496,7 +508,8 @@ void Rasterizer::forward(
 	uint2 h_ranges;
 	for (int i = 0; i < grid.x * grid.y; i++)
 	{
-		cudaMemcpy(&h_ranges, imageState.ranges + i, sizeof(uint2), cudaMemcpyDeviceToHost);
+		cudaMemcpyAsync(&h_ranges, imageState.ranges + i, sizeof(uint2), cudaMemcpyDeviceToHost, stream);
+		cudaStreamSynchronize(stream);
 		std::cout << "Tile " << i << ", start: " << h_ranges.x << ", end: " << h_ranges.y << std::endl;
 	}
 #endif
@@ -505,7 +518,7 @@ void Rasterizer::forward(
 	const float *feature = geometryInfo.use_shs ? (float *)geometryState.rgb : geometryInfo.feature;
 	if (sort_level <= 1)
 	{
-		FORWARD::renderCUDA<<<grid, block>>>(
+		FORWARD::renderCUDA<<<grid, block, 0, stream>>>(
 			W, H, geometryInfo.C, geometryInfo.gamma, rich_info, geometryInfo.use_vertex_color, back_culling,
 			cameraInfo.tan_fovx,
 			cameraInfo.tan_fovy,
@@ -526,11 +539,12 @@ void Rasterizer::forward(
 			forwardOutput.normal,
 			forwardOutput.distortion,
 			forwardOutput.contrib_sum,
-			forwardOutput.contrib_max);
+			forwardOutput.contrib_max,
+			imageState.distortion_moments);
 	}
 	else
 	{
-		FORWARD::renderCUDAResort<<<grid, block>>>(
+		FORWARD::renderCUDAResort<<<grid, block, 0, stream>>>(
 			W, H, geometryInfo.C, geometryInfo.gamma, rich_info, geometryInfo.use_vertex_color, back_culling,
 			cameraInfo.tan_fovx,
 			cameraInfo.tan_fovy,
@@ -551,15 +565,16 @@ void Rasterizer::forward(
 			forwardOutput.normal,
 			forwardOutput.distortion,
 			forwardOutput.contrib_sum,
-			forwardOutput.contrib_max);
+			forwardOutput.contrib_max,
+			imageState.distortion_moments);
 	}
 	CHECK_CUDA(debug);
 
 	// copy n_contribs and final_Ts to output buffers
 	if (rich_info)
 	{
-		cudaMemcpy(forwardOutput.n_contribs, imageState.n_contribs, W * H * sizeof(int), cudaMemcpyDeviceToDevice);
-		cudaMemcpy(forwardOutput.final_Ts, imageState.final_Ts, W * H * sizeof(float), cudaMemcpyDeviceToDevice);
+		cudaMemcpyAsync(forwardOutput.n_contribs, imageState.n_contribs, W * H * sizeof(int), cudaMemcpyDeviceToDevice, stream);
+		cudaMemcpyAsync(forwardOutput.final_Ts, imageState.final_Ts, W * H * sizeof(float), cudaMemcpyDeviceToDevice, stream);
 		CHECK_CUDA(debug);
 	}
 }
@@ -578,6 +593,7 @@ void Rasterizer::backward(
 	const int W = cameraInfo.width;
 	const int H = cameraInfo.height;
 	const int P = geometryInfo.P;
+	const cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
 	const dim3 grid((W + BLOCK_X - 1) / BLOCK_X, (H + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);
@@ -598,8 +614,8 @@ void Rasterizer::backward(
 	const float *feature = geometryInfo.use_shs ? (float *)geometryState.rgb : geometryInfo.feature;
 	if (sort_level <= 1)
 	{
-		BACKWARD::renderCUDA<<<grid, block>>>(
-			W, H, geometryInfo.C, geometryInfo.gamma, rich_info, geometryInfo.use_vertex_color, back_culling,
+		BACKWARD::renderCUDA<<<grid, block, 0, stream>>>(
+			W, H, geometryInfo.C, geometryInfo.gamma, rich_info, geometryInfo.use_vertex_color,
 			cameraInfo.tan_fovx,
 			cameraInfo.tan_fovy,
 			imageState.ranges,
@@ -614,7 +630,8 @@ void Rasterizer::backward(
 			geometryInfo.background,
 			imageState.final_Ts,
 			imageState.n_contribs,
-			backwardInput.depth,
+			imageState.distortion_moments,
+			backwardInput.distortion,
 			lossInput.dL_dout_feature,
 			lossInput.dL_dout_depth,
 			lossInput.dL_dout_normal,
@@ -628,8 +645,8 @@ void Rasterizer::backward(
 	}
 	else
 	{
-		BACKWARD::renderCUDAResort<<<grid, block>>>(
-			W, H, geometryInfo.C, geometryInfo.gamma, rich_info, geometryInfo.use_vertex_color, back_culling,
+		BACKWARD::renderCUDAResort<<<grid, block, 0, stream>>>(
+			W, H, geometryInfo.C, geometryInfo.gamma, rich_info, geometryInfo.use_vertex_color,
 			cameraInfo.tan_fovx,
 			cameraInfo.tan_fovy,
 			imageState.ranges,
@@ -640,13 +657,11 @@ void Rasterizer::backward(
 			geometryState.normal_view,
 			feature,
 			geometryInfo.opacity,
-			geometryInfo.background_depth,
-			geometryInfo.background,
-			imageState.final_Ts,
 			backwardInput.feature,
 			backwardInput.normal,
 			backwardInput.depth,
 			backwardInput.distortion,
+			imageState.distortion_moments,
 			lossInput.dL_dout_feature,
 			lossInput.dL_dout_depth,
 			lossInput.dL_dout_normal,
@@ -660,10 +675,9 @@ void Rasterizer::backward(
 	}
 	CHECK_CUDA(debug);
 
-	BACKWARD::preprocessCUDA<<<(P + 255) / 256, 256>>>(
-		W, H, P, geometryInfo.D, geometryInfo.M, geometryInfo.use_shs, geometryInfo.use_vertex_color, rich_info,
+	BACKWARD::preprocessCUDA<<<(P + 255) / 256, 256, 0, stream>>>(
+		P, geometryInfo.D, geometryInfo.M, geometryInfo.use_shs, geometryInfo.use_vertex_color,
 		cameraInfo.viewmatrix,
-		cameraInfo.projmatrix,
 		cameraInfo.campos,
 		geometryInfo.vertex,
 		geometryInfo.shs,

@@ -156,6 +156,15 @@ rasterizeTrianglesForward(
 			sort_level,
 			debug);
 	}
+	else
+	{
+		out_feature.copy_(background.view({C, 1, 1}));
+		if (rich_info)
+		{
+			depth.fill_(background_depth);
+			final_Ts.fill_(1.0f);
+		}
+	}
 
 	return std::make_tuple(
 		forwardOutput.num_rendered,
@@ -222,8 +231,7 @@ rasterizeTrianglesBackward(
 	if (!(viewmatrix.is_contiguous() && projmatrix.is_contiguous() && campos.is_contiguous() &&
 		  background.is_contiguous() && vertex.is_contiguous() && shs.is_contiguous() && feature.is_contiguous() && opacity.is_contiguous() &&
 		  radii.is_contiguous() && final_feature.is_contiguous() && final_depth.is_contiguous() && final_normal.is_contiguous() && final_distortion.is_contiguous() &&
-		  geometryBuffer.is_contiguous() && binningBuffer.is_contiguous() && imageBuffer.is_contiguous() &&
-		  dL_dout_feature.is_contiguous() && dL_dout_depth.is_contiguous() && dL_dout_normal.is_contiguous()))
+		  geometryBuffer.is_contiguous() && binningBuffer.is_contiguous() && imageBuffer.is_contiguous()))
 	{
 		AT_ERROR("input tensors must be contiguous"); // make sure input tensors are contiguous to avoid memory copy and intermediate variables
 	}
@@ -255,11 +263,15 @@ rasterizeTrianglesBackward(
 		binningBuffer,
 		imageBuffer};
 
+	const auto grad_feature = dL_dout_feature.contiguous();
+	const auto grad_depth = dL_dout_depth.contiguous();
+	const auto grad_normal = dL_dout_normal.contiguous();
+	const auto grad_distortion = dL_dout_distortion.contiguous();
 	Params::LossInput lossInput = {
-		dL_dout_feature.contiguous().data_ptr<float>(),
-		dL_dout_depth.contiguous().data_ptr<float>(),
-		dL_dout_normal.contiguous().data_ptr<float>(),
-		dL_dout_distortion.contiguous().data_ptr<float>()};
+		grad_feature.data_ptr<float>(),
+		grad_depth.data_ptr<float>(),
+		grad_normal.data_ptr<float>(),
+		grad_distortion.data_ptr<float>()};
 
 	torch::Tensor dL_dvertex = torch::zeros({P, 3, 3}, vertex.options());
 	torch::Tensor dL_dv_norm = torch::zeros({P}, vertex.options());

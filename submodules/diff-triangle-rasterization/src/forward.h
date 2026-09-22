@@ -51,7 +51,8 @@ namespace FORWARD
 			float *__restrict__ out_normal,
 			float *__restrict__ out_distort,
 			float *__restrict__ contrib_sum,
-			float *__restrict__ contrib_max);
+			float *__restrict__ contrib_max,
+			float2 *__restrict__ distortion_moments);
 	
 	__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 		renderCUDAResort(
@@ -74,5 +75,6 @@ namespace FORWARD
 			float *__restrict__ out_normal,
 			float *__restrict__ out_distort,
 			float *__restrict__ contrib_sum,
-			float *__restrict__ contrib_max);
+			float *__restrict__ contrib_max,
+			float2 *__restrict__ distortion_moments);
 }

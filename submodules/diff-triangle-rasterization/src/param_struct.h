@@ -102,6 +102,7 @@ namespace Params
 		uint2* ranges;
 		uint32_t* n_contribs;
 		float* final_Ts;
+		float2* distortion_moments;
 
         ImageState(torch::Tensor t, size_t data_size, bool resize = false) {
 			fromTensor(t, data_size, resize);
@@ -111,6 +112,7 @@ namespace Params
 			obtain(chunk, ranges, N, 128);
 			obtain(chunk, n_contribs, N, 128);
 			obtain(chunk, final_Ts, N, 128);
+			obtain(chunk, distortion_moments, N, 128);
 		}
 	};
 

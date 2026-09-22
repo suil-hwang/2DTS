@@ -10,9 +10,8 @@
 namespace BACKWARD
 {
 	__global__ void preprocessCUDA(
-		int W, int H, int P, int D, int M, bool use_shs, bool use_vertex_color, bool rich_info,
+		int P, int D, int M, bool use_shs, bool use_vertex_color,
 		const float *__restrict__ viewmatrix,
-		const float *__restrict__ projmatrix,
 		const float *__restrict__ campos,
 		const float *__restrict__ vertex,
 		const float *__restrict__ shs,
@@ -27,7 +26,7 @@ namespace BACKWARD
 
 	__global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		renderCUDA(
-			int W, int H, int C, float gamma, bool rich_info, bool use_vertex_color, bool back_culling,
+			int W, int H, int C, float gamma, bool rich_info, bool use_vertex_color,
 			float tan_fovx, float tan_fovy,
 			const uint2 *__restrict__ ranges,
 			const uint32_t *__restrict__ point_list,
@@ -41,7 +40,8 @@ namespace BACKWARD
 			const float *__restrict__ background,
 			const float *__restrict__ final_Ts,
 			const uint32_t *__restrict__ n_contribs,
-			const float *__restrict__ depth_image,
+			const float2 *__restrict__ distortion_moments,
+			const float *__restrict__ distortion_image,
 			const float *__restrict__ dL_dout_feature,
 			const float *__restrict__ dL_dout_depth,
 			const float *__restrict__ dL_dout_normal,
@@ -55,7 +55,7 @@ namespace BACKWARD
 
 	__global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		renderCUDAResort(
-			int W, int H, int C, float gamma, bool rich_info, bool use_vertex_color, bool back_culling,
+			int W, int H, int C, float gamma, bool rich_info, bool use_vertex_color,
 			float tan_fovx, float tan_fovy,
 			const uint2 *__restrict__ ranges,
 			const uint32_t *__restrict__ point_list,
@@ -65,13 +65,11 @@ namespace BACKWARD
 			const float3 *__restrict__ s_normal_view,
 			const float *__restrict__ feature,
 			const float *__restrict__ opacity,
-			const float background_depth,
-			const float *__restrict__ background,
-			const float *__restrict__ final_Ts,
 			const float *__restrict__ final_features,
 			const float *__restrict__ final_normals,
 			const float *__restrict__ final_depths,
 			const float *__restrict__ final_distorts,
+			const float2 *__restrict__ distortion_moments,
 			const float *__restrict__ dL_dout_feature,
 			const float *__restrict__ dL_dout_depth,
 			const float *__restrict__ dL_dout_normal,

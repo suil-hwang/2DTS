@@ -111,32 +111,23 @@ __global__ void FORWARD::preprocessCUDA(
 	if (v1_dilated_proj.z <= 0 && v2_dilated_proj.z <= 0 && v3_dilated_proj.z <= 0) // Near culling
 		return;
 
-	// render triangles that extend behind the camera properly
-	if (v1_dilated_view.z <= EPS)
-	{
-		v1_dilated_view.z = 0.001f;
-		v1_dilated_proj = projectPoint(v1_dilated_view, projmatrix);
-	}
-	if (v2_dilated_view.z <= EPS)
-	{
-		v2_dilated_view.z = 0.001f;
-		v2_dilated_proj = projectPoint(v2_dilated_view, projmatrix);
-	}
-	if (v3_dilated_view.z <= EPS)
-	{
-		v3_dilated_view.z = 0.001f;
-		v3_dilated_proj = projectPoint(v3_dilated_view, projmatrix);
-	}
+	// A support crossing the camera plane can have an unbounded projection.
+	const bool support_crosses_camera = v1_dilated_view.z <= EPS || v2_dilated_view.z <= EPS || v3_dilated_view.z <= EPS;
 
-	if (back_culling && cross(v2_dilated_proj - v1_dilated_proj, v3_dilated_proj - v1_dilated_proj).z >= 0) // Back-face culling
-		return;
+	if (back_culling)
+	{
+		const float facing = support_crosses_camera ? dot(v1_view, normal_view)
+			: cross(v2_dilated_proj - v1_dilated_proj, v3_dilated_proj - v1_dilated_proj).z;
+		if (facing >= 0)
+			return;
+	}
 
 	const float2 v1_dilated_2D = {projToPix(v1_dilated_proj.x, W), projToPix(v1_dilated_proj.y, H)};
 	const float2 v2_dilated_2D = {projToPix(v2_dilated_proj.x, W), projToPix(v2_dilated_proj.y, H)};
 	const float2 v3_dilated_2D = {projToPix(v3_dilated_proj.x, W), projToPix(v3_dilated_proj.y, H)};
 
-	float2 v_min = min(v1_dilated_2D, v2_dilated_2D, v3_dilated_2D);
-	float2 v_max = max(v1_dilated_2D, v2_dilated_2D, v3_dilated_2D);
+	float2 v_min = support_crosses_camera ? make_float2(-0.5f, -0.5f) : min(v1_dilated_2D, v2_dilated_2D, v3_dilated_2D);
+	float2 v_max = support_crosses_camera ? make_float2((float)W - 0.5f, (float)H - 0.5f) : max(v1_dilated_2D, v2_dilated_2D, v3_dilated_2D);
 	if (v_min.x >= ((float)W - 0.5f) || v_min.y >= ((float)H - 0.5f) || v_max.x < -0.5f || v_max.y < -0.5f)
 		return;
 	v_min = {min(max(v_min.x, -0.5f), (float)W - 0.5f), min(max(v_min.y, -0.5f), (float)H - 0.5f)};
@@ -201,7 +192,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		float *__restrict__ out_normal,
 		float *__restrict__ out_distort,
 		float *__restrict__ contrib_sum,
-		float *__restrict__ contrib_max)
+		float *__restrict__ contrib_max,
+		float2 *__restrict__ distortion_moments)
 {
 	// Identify current tile and pixel.
 	auto block = cg::this_thread_block();
@@ -236,6 +228,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	float accum_feature[MAX_CHANNELS] = {0};
 	float3 accum_normal = {0, 0, 0};
 	float accum_depth = 0.0f;
+	float accum_weight = 0.0f;
 	float accum_depth_squared = 0.0f;
 	float accum_distort = 0.0f;
 
@@ -317,7 +310,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 				atomicMaxFloat(&contrib_max[global_id], contrib);
 
 				accum_normal += normal_view * sqrt(inv_n_dot_n) * contrib;
-				accum_distort += (depth * depth * (1.0f - T) + accum_depth_squared - 2.0f * depth * accum_depth) * contrib;
+				accum_distort += (depth * depth * accum_weight + accum_depth_squared - 2.0f * depth * accum_depth) * contrib;
+				accum_weight += contrib;
 				accum_depth += depth * contrib;
 				accum_depth_squared += depth * depth * contrib;
 			}
@@ -339,6 +333,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 
 		if (rich_info)
 		{
+			// Preserve raw moments before background addition or 1-T cancellation.
+			distortion_moments[pix_id] = make_float2(accum_weight, accum_depth);
 			out_distort[pix_id] = accum_distort;
 			out_depth[pix_id] = accum_depth + T * background_depth;
 			out_normal[pix_id] = accum_normal.x;
@@ -378,7 +374,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		float *__restrict__ out_normal,
 		float *__restrict__ out_distort,
 		float *__restrict__ contrib_sum,
-		float *__restrict__ contrib_max)
+		float *__restrict__ contrib_max,
+		float2 *__restrict__ distortion_moments)
 {
 	// Identify current tile and pixel.
 	auto block = cg::this_thread_block();
@@ -401,6 +398,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	float accum_feature[MAX_CHANNELS] = {0};
 	float3 accum_normal = {0, 0, 0};
 	float accum_depth = 0.0f;
+	float accum_weight = 0.0f;
 	float accum_depth_squared = 0.0f;
 	float accum_distort = 0.0f;
 	uint32_t n_contrib = 0;
@@ -457,7 +455,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			atomicMaxFloat(&contrib_max[global_id], contrib);
 
 			accum_normal += normal_view * sqrt(inv_n_dot_n) * contrib;
-			accum_distort += (depth * depth * (1.0f - T) + accum_depth_squared - 2.0f * depth * accum_depth) * contrib;
+			accum_distort += (depth * depth * accum_weight + accum_depth_squared - 2.0f * depth * accum_depth) * contrib;
+			accum_weight += contrib;
 			accum_depth += depth * contrib;
 			accum_depth_squared += depth * depth * contrib;
 		}
@@ -543,6 +542,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 
 		if (rich_info)
 		{
+			// Preserve raw moments before background addition or 1-T cancellation.
+			distortion_moments[pix_id] = make_float2(accum_weight, accum_depth);
 			out_distort[pix_id] = accum_distort;
 			out_depth[pix_id] = accum_depth + T * background_depth;
 			out_normal[pix_id] = accum_normal.x;
