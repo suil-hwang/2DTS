@@ -12,6 +12,50 @@ from ..utils.camera import Camera
 from ..utils.vis_utils import save_image_tensor
 
 
+class VectorAdam(torch.optim.Optimizer):
+    """
+    Based on https://github.com/iszihan/VectorAdam.
+    """
+
+    def __init__(self, params, lr=0.1, betas=(0.9, 0.999), eps=1e-8, axis=-1):
+        defaults = dict(lr=lr, betas=betas, eps=eps, axis=axis)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            axis = group["axis"]
+            for param in group["params"]:
+                grad = param.grad
+                if grad is None:
+                    continue
+
+                state = self.state[param]
+                if not state:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(param)
+                    state["exp_avg_sq"] = torch.zeros_like(param)
+
+                state["step"] += 1
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                grad_sq = grad.square() if axis is None else torch.linalg.vector_norm(grad, dim=axis, keepdim=True).square_()
+                exp_avg_sq.mul_(beta2).add_(grad_sq, alpha=1.0 - beta2)
+
+                bias_correction1 = 1.0 - beta1 ** state["step"]
+                bias_correction2 = 1.0 - beta2 ** state["step"]
+                denominator = (exp_avg_sq / bias_correction2).sqrt_().add_(group["eps"])
+                param.addcdiv_(exp_avg, denominator, value=-group["lr"] / bias_correction1)
+
+        return loss
+
+
 class VideoLogger:
     def __init__(self, cameras: list[Camera], save_dir: str):
         self.cameras = cameras
@@ -277,8 +321,8 @@ class DepthNormalLoss(nn.Module):
         depth_grad = self.scharr(depth).squeeze(0)
         Dx, Dy = torch.unbind(depth_grad, 0)
         W, H = depth.shape[-1], depth.shape[-2]
-        x = torch.arange(W, dtype=torch.float32).to(depth.device)
-        y = torch.arange(H, dtype=torch.float32).to(depth.device)
+        x = torch.arange(W, dtype=torch.float32, device=depth.device)
+        y = torch.arange(H, dtype=torch.float32, device=depth.device)
         x, y = torch.meshgrid(x, y, indexing="xy")
 
         nx = W * Dx / (2 * tan_fovx)
@@ -473,9 +517,9 @@ def nearest_neighbor(pc: torch.Tensor, bs: int = 1) -> torch.Tensor:
 
 
 def nearest_dist2(pc: torch.Tensor, nearest_indices: torch.Tensor) -> torch.Tensor:
-    assert pc.dim() == 2 and pc.size(1) == 3 and nearest_indices.dim() == 1 and nearest_indices.size(0) == pc.size(0)
-    nearest_point = pc[nearest_indices]
-    return ((pc - nearest_point) ** 2).sum(dim=1)
+    assert pc.ndim == 2 and pc.shape[1] == 3
+    assert nearest_indices.shape == (pc.shape[0],)
+    return (pc - pc[nearest_indices]).square().sum(dim=1)
 
 
 ssimLoss = SSIMLoss()

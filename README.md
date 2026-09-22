@@ -185,8 +185,18 @@ python -m py_viewer.viwer --model outputs/baselines/lego_20260921_135232/mesh/ck
 required. Snapshots contain the rendered viewport, with RGB uint8 conversion
 performed once by the framebuffer. The bounded run closes the window it creates.
 
-The legacy [Viser viewer][3] remains in `viser_viewer.py` and requires Viser,
-which is excluded from `environment.yml`.
+The browser-based [Viser viewer][3] is available in `viser_viewer.py`, verified
+with Viser 1.1.1 and trimesh 5.1.0. Both dependencies are in `environment.yml`.
+
+```powershell
+python viser_viewer.py --config config/NerfSynthetic_VanillaTS_mesh.yaml --dataset data/nerf_synthetic --scene lego --output-dir outputs/full_train_lego/artifacts/lego --port 8081
+```
+
+`--output-dir` selects the scene directory containing `ckpt/`, `point_cloud/`,
+and `glb/`; otherwise the directory is derived from the config and scene name.
+Checkpoints take precedence over PLY files with the same name to restore runtime
+render settings. The viewer loads the dataset directly without initializing
+training or LPIPS. GLB scenes retain their node transforms and materials.
 
 ## - Notes
 We provided two distinct training configurations: VanillaTS and VanillaTS_mesh.

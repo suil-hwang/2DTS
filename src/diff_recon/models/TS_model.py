@@ -393,10 +393,10 @@ class TSModel(nn.Module):
 
         if grad is not None:
             self.gradient_accum += grad
-            self.gradient_denom[contrib_max > 0] += 1
+            self.gradient_denom.add_(contrib_max > 0)
         self.contrib_sum = torch.max(self.contrib_sum, contrib_sum)
         self.contrib_max = torch.max(self.contrib_max, contrib_max)
-        self.contrib_denom[radii > 0] += 1
+        self.contrib_denom.add_(radii > 0)
         self.max_radii2D = torch.max(self.max_radii2D, radii)
 
     def _densification(self, iteration: int, render_pkg: dict[str, torch.Tensor] = None):

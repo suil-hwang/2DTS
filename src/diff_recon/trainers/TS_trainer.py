@@ -51,16 +51,10 @@ class TSTrainer:
 
         # Initialize model
         train_size = self.dataset.getTrainDatasetSize()
-        if (
-            self.config.model.model_update is not None
-            and self.config.model.model_update.contribution_pruning is not None
-            and self.config.model.model_update.contribution_pruning.interval_iter == -1
-        ):
-            self.logger.info(f"Setting contribution_pruning interval_iter to train dataset size: {train_size}")
-            assert (
-                self.config.model.model_update.contribution_pruning.start_iter % train_size == 0
-            ), "contribution_pruning.start_iter must be multiple of train dataset size if interval_iter is -1"
-            self.config.model.model_update.contribution_pruning.interval_iter = train_size
+        pruning = getattr(self.config.model.model_update, "contribution_pruning", None)
+        if pruning is not None and pruning.interval_iter == -1:
+            assert pruning.start_iter % train_size == 0, "Auto pruning interval requires start_iter to align with train_size"
+            pruning.interval_iter = train_size
         self.model = TSModel(self.config.model, logger=self.logger, device=self.device)
         self.model.setup_color_affine(train_size)
         self.model.setup_scene_info(self.dataset.getSceneInfo())
@@ -314,9 +308,9 @@ class TSTrainer:
             camera = test_data.to(self.device)
             image = self.model.forward(camera, background, False, False)["render"].clip(min=0, max=1)
             gt_image = camera.gt_image
-            psnr_vals.append(psnr(image, gt_image, camera.alpha_mask if eval_alpha_mask else None).item())
-            ssim_vals.append(1.0 - self.ssimLoss(image, gt_image).item())
-            lpips_vals.append(self.lpips(image.unsqueeze(0), gt_image.unsqueeze(0)).item())
+            psnr_vals.append(psnr(image, gt_image, camera.alpha_mask if eval_alpha_mask else None))
+            ssim_vals.append(self.ssimLoss(image, gt_image))
+            lpips_vals.append(self.lpips(image.unsqueeze(0), gt_image.unsqueeze(0)))
 
             if use_tensorboard and i in self._save_img_idx:
                 img_log_idx = self._save_img_idx.index(i)
@@ -327,6 +321,11 @@ class TSTrainer:
             if save_img:
                 save_image_tensor(image, f"{self.output_dir}/eval/{i:>05d}.png")
                 save_image_tensor(gt_image, f"{self.output_dir}/eval_gt/{i:>05d}.png")
+
+        if psnr_vals:
+            metric_vals = torch.stack([torch.stack(values) for values in (psnr_vals, ssim_vals, lpips_vals)])
+            metric_vals = metric_vals.cpu().numpy().astype(np.float64)
+            psnr_vals, ssim_vals, lpips_vals = metric_vals[0], 1.0 - metric_vals[1], metric_vals[2]
 
         mean_psnr = np.mean(psnr_vals)
         mean_ssim = np.mean(ssim_vals)

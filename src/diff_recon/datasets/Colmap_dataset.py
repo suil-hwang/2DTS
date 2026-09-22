@@ -107,7 +107,7 @@ class ColmapDataset(Dataset):
         image = image.resize(img_size, Image.Resampling.BILINEAR)
         image_array = np.array(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
         image.close()
-        return image_array
+        return np.ascontiguousarray(image_array)
 
     def __len__(self):
         return len(self.cam_infos)
@@ -124,7 +124,8 @@ class ColmapDataset(Dataset):
             gt_alpha_mask = gt_image_array[3]
             gt_image_array = gt_image_array[:3]
             if bg_color is not None:
-                gt_image_array = gt_image_array * gt_alpha_mask + bg_color.reshape(3, 1, 1) * (1 - gt_alpha_mask)
+                gt_image_array = gt_image_array * gt_alpha_mask
+                gt_image_array += bg_color.reshape(3, 1, 1) * (1 - gt_alpha_mask)
         else:
             gt_alpha_mask = None
 
