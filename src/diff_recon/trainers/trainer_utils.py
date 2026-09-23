@@ -8,6 +8,11 @@ from pathlib import Path
 
 from simple_knn import nearestNeighbor
 
+try:
+    from fused_ssim import fused_ssim
+except ImportError:
+    fused_ssim = None
+
 from ..utils.camera import Camera
 from ..utils.vis_utils import save_image_tensor
 
@@ -152,6 +157,16 @@ class SSIM(nn.Module):
         return ssim_val
 
 
+class FusedSSIM(nn.Module):
+    """SSIM() computed by the fused-ssim CUDA kernel (same window, constants and padding); only img1 gets gradients.
+
+    The kernels launch on the default CUDA stream, which the trainer uses.
+    """
+
+    def forward(self, img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
+        return fused_ssim(img1, img2, train=torch.is_grad_enabled())
+
+
 def normalize_shape(*imgs) -> tuple[torch.Tensor, ...]:
     # Normalize input image shapes to (B, C, H, W)
     normalized_imgs = []
@@ -175,7 +190,7 @@ def normalize_shape(*imgs) -> tuple[torch.Tensor, ...]:
 class SSIMLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        self.ssim = SSIM()
+        self.ssim = FusedSSIM() if fused_ssim is not None else SSIM()
 
     def forward(self, img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
         img1, img2 = normalize_shape(img1, img2)
@@ -437,8 +452,8 @@ class ConsistencyLoss(nn.Module):
             return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
         xyz_proj = camera_ref.project_points(xyz)
 
-        # filter out points that are outside the view frustum
-        frustum_mask = (xyz_proj[:, 0] > -1) & (xyz_proj[:, 0] < 1) & (xyz_proj[:, 1] > -1) & (xyz_proj[:, 1] < 1) & (xyz_proj[:, 2] > 0)
+        # filter out points that are outside the view frustum; NDC z > 0 also holds behind the camera, so test view depth
+        frustum_mask = (xyz_proj[:, :2].abs() < 1).all(dim=1) & (camera_ref.project_points(xyz, "view")[:, 2] > camera_ref.znear)
         # print("In frustum:", frustum_mask.float().mean().item() * 100.0, "%")
         if not frustum_mask.any():
             return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
@@ -508,6 +523,7 @@ def psnr(img1: torch.Tensor, img2: torch.Tensor, mask: torch.Tensor = None) -> t
     if mask is None:
         mse = ((img1 - img2) ** 2).mean() + 1e-10
     else:
+        mask = mask.expand_as(img1)  # count every channel of a masked pixel
         mse = (((img1 - img2) ** 2) * mask).sum() / (mask.sum() + 1e-10) + 1e-10
     return 20 * torch.log10(1.0 / torch.sqrt(mse))
 

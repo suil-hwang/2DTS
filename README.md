@@ -17,7 +17,7 @@ Official implementation of [2DTS][1] (2D Triangle Splatting for Direct Different
 We provide a complete training pipeline for 2DTS, a differentiable 3D Geometric Representation adapted from [3DGS][2] (3D Gaussian Splatting) that replace the Gaussians primitives with triangle primitives, while retaining the full differentiability of the model.
 The proposed method is capable of producing triangle meshes with high visual fidelity through an end-to-end training pipeline.
 
-This checkout contains the 2DTS pipeline only. Standalone 3DGS and hybrid Gaussian/triangle rendering have been removed. The two native dependencies are `simple-knn` and `diff-triangle-rasterization`; point-cloud initialization accepts RGB or SH DC colors from PLY files. Triangle mesh and GLB/glTF utilities remain available.
+This checkout contains the 2DTS pipeline only. Standalone 3DGS and hybrid Gaussian/triangle rendering have been removed. The native dependencies are `simple-knn` and `diff-triangle-rasterization`, plus the optional `fused-ssim` kernel that speeds up the SSIM training loss; point-cloud initialization accepts RGB or SH DC colors from PLY files. Triangle mesh and GLB/glTF utilities remain available.
 
 ![demo_image](./assets/demo_image.png)
 
@@ -41,10 +41,11 @@ Furthermore, our approach produces reconstructed meshes with superior visual qua
 For this checkout's Python 3.12 / CUDA 13.0 environment, use [`environment.yml`](./environment.yml) and the steps below.
 
 1. Prepare CUDA Toolkit 13.0 and the host C++ compiler, and set `CUDA_HOME` to the toolkit path. On Windows, use an x64 Visual Studio developer shell.
-2. From this checkout's root, create the environment: `conda env create -f environment.yml`.
-3. Activate it: `conda activate 2DTS`.
-4. Build the native dependencies: `python -m pip install --no-build-isolation --no-deps ./submodules/simple-knn ./submodules/diff-triangle-rasterization`.
-5. Install the project: `python -m pip install --no-build-isolation --no-deps -e .`.
+2. Fetch the optional `fused-ssim` git submodule: `git submodule update --init --recursive`.
+3. From this checkout's root, create the environment: `conda env create -f environment.yml`.
+4. Activate it: `conda activate 2DTS`.
+5. Build the native dependencies: `python -m pip install --no-build-isolation --no-deps ./submodules/simple-knn ./submodules/diff-triangle-rasterization`. Optionally add `./submodules/fused-ssim`; SSIM (training loss and evaluation metric) uses it when installed and otherwise falls back to the PyTorch implementation. On Windows, if nvcc stops with `C2872: 'std': ambiguous symbol` or errors in `CUDACachingAllocator.h`, set `NVCC_APPEND_FLAGS` to `-Xcompiler /permissive- -DWIN32_LEAN_AND_MEAN` first (cmd: `set NVCC_APPEND_FLAGS=...`, PowerShell: `$env:NVCC_APPEND_FLAGS = "..."`).
+6. Install the project: `python -m pip install --no-build-isolation --no-deps -e .`.
 
 ### Install with AI
 
@@ -53,7 +54,7 @@ If you use an AI coding agent in your editor or terminal, you can ask it to inst
 From the project root, give the agent a prompt like this:
 
 ```text
-Install this 2DTS repository for local development using environment.yml. Activate 2DTS, build simple-knn and diff-triangle-rasterization with --no-build-isolation --no-deps, then install the root package with the same flags and -e . Verify the CUDA toolkit, host compiler, extension imports, and a small CUDA forward/backward run.
+Install this 2DTS repository for local development using environment.yml. Initialize the git submodules, activate 2DTS, build simple-knn, diff-triangle-rasterization, and the optional fused-ssim with --no-build-isolation --no-deps, then install the root package with the same flags and -e . Verify the CUDA toolkit, host compiler, extension imports, and a small CUDA forward/backward run.
 ```
 
 
@@ -220,6 +221,7 @@ This repository contains code under **two different licenses**:
   - `src/diff_recon/`
   - `submodules/diff-triangle-rasterization/`
   - See [LICENSE](./LICENSE)
+  - The optional `submodules/fused-ssim/` submodule is also MIT licensed (© Rahul Goel); see its own LICENSE.
 
 Please make sure to comply with both licenses when using this repository.
 

@@ -1,4 +1,5 @@
 import os
+import shutil
 import time
 
 import numpy as np
@@ -36,7 +37,7 @@ class TSTrainer:
 
         self.output_dir = os.path.join(output_dir, self.exp_name)
         if clean_output_dir and log_file:
-            os.system(f"rm -rf {self.output_dir}")
+            shutil.rmtree(self.output_dir, ignore_errors=True)
 
         self.logger = Logger(time_str, os.path.join(self.output_dir, "log") if log_file else None, use_tensorboard=use_tensorboard)
         self.logger.info(f"config args: {self.config}")
@@ -61,6 +62,7 @@ class TSTrainer:
 
         # Initialize loss module
         self.ssimLoss = ssimLoss.to(self.device)
+        self.logger.info(f"SSIM loss backend: {'fused-ssim' if fused_ssim is not None else 'PyTorch'}")
         self.lpips = LPIPS(net_type="vgg", reduction="mean", normalize=True).to(self.device)
         if self.config.trainer.w_dog > 0:
             self.dogLoss = dogLoss.to(self.device)
@@ -78,8 +80,6 @@ class TSTrainer:
             self.consistencyLoss = ConsistencyLoss(error_thres=error_thres, n_sample=n_sample, patch_size=patch_size, dilation=dilation)
         self._nearest_indices_cache = None
         self._nearest_vertex = None
-
-        self.accum_loss = []
 
         # For logging and profiling
         test_img_count = self.dataset.getTestDatasetSize()
@@ -183,7 +183,7 @@ class TSTrainer:
             consistency_geo_loss, consistency_color_loss = 0, 0
 
         # regularization losses
-        scaling_reg = scaling.mean()
+        scaling_reg = scaling.mean() if w_scaling_reg != 0 else 0
 
         opacity_reg = 0
         if w_opacity_reg > 0:
@@ -237,20 +237,16 @@ class TSTrainer:
     def _optimize(self, iteration: int, render_pkg: dict):
         bs = self.config.trainer.batch_size if self.config.trainer.batch_size is not None else 1
 
-        render_pkg["grad"] = 0
-        self.accum_loss.append(render_pkg["loss"])
-        if len(self.accum_loss) < bs:
-            return
-
-        total_loss = torch.sum(torch.stack(self.accum_loss))
-        total_loss.backward()
+        # Backpropagate every view so its graph is freed and its densification gradient is recorded;
+        # parameter gradients accumulate (sum) until the batch of views is complete.
+        render_pkg["loss"].backward()
         render_pkg["grad"] = render_pkg["grad_holder"].grad
+        if iteration % bs != 0:
+            return
 
         self.model.update_learning_rate(iteration)
         self.model.optimizer.step()
         self.model.optimizer.zero_grad(set_to_none=True)
-        render_pkg["grad_holder"].grad = None  # reset grad holder
-        self.accum_loss = []
 
     def _log_stats(self, log_pkg: dict):
         iteration = log_pkg["iteration"]
@@ -410,10 +406,10 @@ class TSTrainer:
                 self._evaluate(iteration, save_img=config.save_eval_img)
 
             timer.log("model update")
-            if self.config.trainer.save_train_img:
+            if config.save_train_img:
                 render_pkg["densification_img"] = None
             self.model.model_update(iteration, render_pkg)
-            if "densification_img" in render_pkg and render_pkg["densification_img"] is not None:
+            if render_pkg.get("densification_img") is not None:
                 save_image_tensor(render_pkg["densification_img"], f"{self.output_dir}/train/{iteration:>05d}_densification.png")
 
             if (config.save_iterations is not None and iteration in config.save_iterations) or (
@@ -462,21 +458,21 @@ class TSTrainer:
     def _save_pcd(self, ply_path: str, rescale_ratio: float = 1.0, n_sample: int = 5_000_000, grid_size: float = None):
         self.logger.info("Rendering point cloud from training views")
 
-        pcd = PointCloud()
+        view_pcds = []
         pbar = tqdm(range(self.dataset.getTrainDatasetSize()))
         for i in pbar:
             camera = self.dataset.getTrainData(i).to(self.device)
             camera.image_width = int(camera.image_width * rescale_ratio)
             camera.image_height = int(camera.image_height * rescale_ratio)
             cur_pcd = self.model.render_points(camera)
-            pcd += cur_pcd
+            view_pcds.append(cur_pcd)
             pbar.set_postfix_str(f"N points: {len(cur_pcd)}")
+        # Concatenate once; accumulating with += copies all previous points for every view.
+        pcd = PointCloud(*(np.concatenate([getattr(p, name) for p in view_pcds]) for name in ("points", "colors", "normals")))
 
         if grid_size is not None:
             self.logger.info(f"Total points: {len(pcd)}, grid sampling with grid size {grid_size}")
-            xyz = torch.tensor(pcd.points).to(self.device)
-            color = torch.tensor(pcd.colors).to(self.device)
-            normal = torch.tensor(pcd.normals).to(self.device)
+            xyz, color, normal = (torch.as_tensor(values, device=self.device) for values in (pcd.points, pcd.colors, pcd.normals))
             pcd = PointCloud(*to_numpy(*grid_sampling(xyz, color, normal, grid_size=grid_size)))
 
         if n_sample is not None and len(pcd) > n_sample:
