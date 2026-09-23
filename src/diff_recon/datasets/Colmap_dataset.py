@@ -67,7 +67,7 @@ class ColmapDataset(Dataset):
             sorted_ids = np.lexsort((angles, dists))
 
             mask = (angles[sorted_ids] < args.max_angle) & (dists[sorted_ids] > args.min_dist) & (dists[sorted_ids] < args.max_dist)
-            mask[i] = False  # exclude itself
+            mask &= sorted_ids != i  # exclude itself
             sorted_ids = sorted_ids[mask][: args.max_n]
             neighbor_cams.append(sorted_ids.tolist())
         return neighbor_cams

@@ -77,7 +77,8 @@ __global__ void FORWARD::preprocessCUDA(
 	bool *__restrict__ s_clamped,
 	uint32_t *__restrict__ s_tiles_touched,
 	uint2 *__restrict__ s_rect_min,
-	uint2 *__restrict__ s_rect_max)
+	uint2 *__restrict__ s_rect_max,
+	float2 *__restrict__ s_support_2D)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -100,7 +101,7 @@ __global__ void FORWARD::preprocessCUDA(
 		return;
 
 	// calculate coverage of the triangle in screen space
-	const float dilation = pow(-2.0f * log(G_THRES), 0.5f / gamma);
+	const float dilation = supportEcc(gamma);
 	float3 v1_dilated_view = center_view + dilation * (v1_view - center_view);
 	float3 v2_dilated_view = center_view + dilation * (v2_view - center_view);
 	float3 v3_dilated_view = center_view + dilation * (v3_view - center_view);
@@ -162,7 +163,15 @@ __global__ void FORWARD::preprocessCUDA(
 	s_v3_view[idx] = v3_view;
 	s_normal_view[idx] = normal_view;
 	s_depth[idx] = center_view.z;
-	s_tiles_touched[idx] = (rect_max.x - rect_min.x) * (rect_max.y - rect_min.y);
+	// Bin only into tiles the support reaches; every pixel of the other tiles would reject this triangle.
+	const float2 support_2D[3] = {v1_dilated_2D, v2_dilated_2D, v3_dilated_2D};
+	uint32_t tiles_touched = 0;
+	for (uint32_t y = rect_min.y; y < rect_max.y; y++)
+		for (uint32_t x = rect_min.x; x < rect_max.x; x++)
+			tiles_touched += support_crosses_camera || triangleOverlapsTile(support_2D, x, y, W, H);
+	s_tiles_touched[idx] = tiles_touched;
+	for (int i = 0; i < 3; i++)
+		s_support_2D[3 * idx + i] = support_2D[i];
 	s_rect_min[idx] = rect_min;
 	s_rect_max[idx] = rect_max;
 	radii[idx] = max(ceil(v_max.x - v_min.x), ceil(v_max.y - v_min.y));
@@ -204,6 +213,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	const uint2 pix = {group_index.x * BLOCK_X + thread_index.x, group_index.y * BLOCK_Y + thread_index.y};
 	const uint32_t pix_id = W * pix.y + pix.x;
 	const float3 p_ray = {tan_fovx * pixToProj((float)pix.x, W), tan_fovy * pixToProj((float)pix.y, H), 1.0f};
+	const float ecc_max = supportEcc(gamma);
 
 	const bool inside = pix.x < W && pix.y < H; // Check if this thread is associated with a valid pixel or outside.
 	bool done = !inside;						// Done threads can help with fetching, but don't rasterize
@@ -261,55 +271,28 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			// Keep track of current position in range
 			n_contrib++;
 
-			const float3 v1_view = collected_v1_view[j];
-			const float3 v2_view = collected_v2_view[j];
-			const float3 v3_view = collected_v3_view[j];
-			const float3 normal_view = collected_normal_view[j];
-
-			const float p_ray_dot_n = dot(p_ray, normal_view);
-			if (abs(p_ray_dot_n) < EPS)
-				continue;
-			const float depth = dot(v1_view, normal_view) / p_ray_dot_n;
-			if (depth < 0.0f)
+			TriangleSample s;
+			if (!sampleTriangle(p_ray, collected_v1_view[j], collected_v2_view[j], collected_v3_view[j], collected_normal_view[j], gamma, ecc_max, s))
 				continue;
 
-			const float3 p_view = depth * p_ray;
-			const float3 p_v1 = v1_view - p_view;
-			const float3 p_v2 = v2_view - p_view;
-			const float3 p_v3 = v3_view - p_view;
-
-			const float inv_n_dot_n = 1.0f / dot(normal_view, normal_view);
-			const float a1 = dot(cross(p_v2, p_v3), normal_view) * inv_n_dot_n;
-			const float a2 = dot(cross(p_v3, p_v1), normal_view) * inv_n_dot_n;
-			const float a3 = 1.0f - a1 - a2;
-			const float ecc = 1.0f - 3.0f * min(min(a1, a2), a3);
-			if (ecc < 0.0f || ecc > 10.0f)
-				continue;
-
-			const float power = -0.5f * pow(ecc, 2.0f * gamma);
-			const float op = collected_opacity[j];
-			const float G = exp(power);
-			const float alpha = min(ALPHA_THRES, op * G);
-			if (G < G_THRES)
-				continue;
-
+			const float alpha = min(ALPHA_THRES, collected_opacity[j] * s.G);
 			const float contrib = alpha * T;
 			const int global_id = collected_id[j];
 
 			for (int ch = 0; ch < C; ch++)
 			{
-				const float feat = use_vertex_color ? (feature[global_id * 3 * C + ch] * a1 + feature[global_id * 3 * C + C + ch] * a2 + feature[global_id * 3 * C + 2 * C + ch] * a3)
+				const float feat = use_vertex_color ? (feature[global_id * 3 * C + ch] * s.a1 + feature[global_id * 3 * C + C + ch] * s.a2 + feature[global_id * 3 * C + 2 * C + ch] * s.a3)
 													: feature[global_id * C + ch];
 				accum_feature[ch] += feat * contrib;
 			}
 
 			if (rich_info)
 			{
-				const int global_id = collected_id[j];
 				atomicAdd(&contrib_sum[global_id], contrib);
 				atomicMaxFloat(&contrib_max[global_id], contrib);
 
-				accum_normal += normal_view * sqrt(inv_n_dot_n) * contrib;
+				const float depth = s.depth;
+				accum_normal += collected_normal_view[j] * sqrt(s.inv_n_dot_n) * contrib;
 				accum_distort += (depth * depth * accum_weight + accum_depth_squared - 2.0f * depth * accum_depth) * contrib;
 				accum_weight += contrib;
 				accum_depth += depth * contrib;
@@ -386,6 +369,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	const uint2 pix = {group_index.x * BLOCK_X + thread_index.x, group_index.y * BLOCK_Y + thread_index.y};
 	const uint32_t pix_id = W * pix.y + pix.x;
 	const float3 p_ray = {tan_fovx * pixToProj((float)pix.x, W), tan_fovy * pixToProj((float)pix.y, H), 1.0f};
+	const float ecc_max = supportEcc(gamma);
 
 	const bool inside = pix.x < W && pix.y < H; // Check if this thread is associated with a valid pixel or outside.
 	bool done = !inside;
@@ -413,38 +397,20 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		if (sort_num == 0)
 			return;
 
-		// Always blend the closest sample
+		// Always blend the closest sample; recompute it rather than keep it in the sort buffer
 		const int global_id = sort_buffer[0].global_id;
-		const float depth = sort_buffer[0].depth;
-
-		// Redo some computations because memory allocation is the bottleneck
-		const float3 v1_view = s_v1_view[global_id];
-		const float3 v2_view = s_v2_view[global_id];
-		const float3 v3_view = s_v3_view[global_id];
 		const float3 normal_view = s_normal_view[global_id];
+		TriangleSample s;
+		sampleTriangle(p_ray, s_v1_view[global_id], s_v2_view[global_id], s_v3_view[global_id], normal_view, gamma, ecc_max, s);
+		const float depth = s.depth;
 
-		const float3 p_view = depth * p_ray;
-		const float3 p_v1 = v1_view - p_view;
-		const float3 p_v2 = v2_view - p_view;
-		const float3 p_v3 = v3_view - p_view;
-
-		const float inv_n_dot_n = 1.0f / dot(normal_view, normal_view);
-		const float a1 = dot(cross(p_v2, p_v3), normal_view) * inv_n_dot_n;
-		const float a2 = dot(cross(p_v3, p_v1), normal_view) * inv_n_dot_n;
-		const float a3 = 1.0f - a1 - a2;
-		const float ecc = 1.0f - 3.0f * min(min(a1, a2), a3);
-
-		const float power = -0.5f * pow(ecc, 2.0f * gamma);
-		const float op = opacity[global_id];
-		const float G = exp(power);
-		const float alpha = min(ALPHA_THRES, op * G);
-
+		const float alpha = min(ALPHA_THRES, opacity[global_id] * s.G);
 		const float contrib = alpha * T;
 		n_contrib++;
 
 		for (int ch = 0; ch < C; ch++)
 		{
-			const float feat = use_vertex_color ? (feature[global_id * 3 * C + ch] * a1 + feature[global_id * 3 * C + C + ch] * a2 + feature[global_id * 3 * C + 2 * C + ch] * a3)
+			const float feat = use_vertex_color ? (feature[global_id * 3 * C + ch] * s.a1 + feature[global_id * 3 * C + C + ch] * s.a2 + feature[global_id * 3 * C + 2 * C + ch] * s.a3)
 													: feature[global_id * C + ch];
 			accum_feature[ch] += feat * contrib;
 		}
@@ -454,7 +420,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			atomicAdd(&contrib_sum[global_id], contrib);
 			atomicMaxFloat(&contrib_max[global_id], contrib);
 
-			accum_normal += normal_view * sqrt(inv_n_dot_n) * contrib;
+			accum_normal += normal_view * sqrt(s.inv_n_dot_n) * contrib;
 			accum_distort += (depth * depth * accum_weight + accum_depth_squared - 2.0f * depth * accum_depth) * contrib;
 			accum_weight += contrib;
 			accum_depth += depth * contrib;
@@ -479,40 +445,12 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	{
 		// Find the next sample to blend
 		const int global_id = point_list[i];
-		const float3 v1_view = s_v1_view[global_id];
-		const float3 v2_view = s_v2_view[global_id];
-		const float3 v3_view = s_v3_view[global_id];
-		const float3 normal_view = s_normal_view[global_id];
-
-		const float p_ray_dot_n = dot(p_ray, normal_view);
-		if (abs(p_ray_dot_n) < EPS)
-			continue;
-		const float depth = dot(v1_view, normal_view) / p_ray_dot_n;
-		if (depth < 0.0f)
-			continue;
-
-		const float3 p_view = depth * p_ray;
-		const float3 p_v1 = v1_view - p_view;
-		const float3 p_v2 = v2_view - p_view;
-		const float3 p_v3 = v3_view - p_view;
-
-		const float inv_n_dot_n = 1.0f / dot(normal_view, normal_view);
-		const float a1 = dot(cross(p_v2, p_v3), normal_view) * inv_n_dot_n;
-		const float a2 = dot(cross(p_v3, p_v1), normal_view) * inv_n_dot_n;
-		const float a3 = 1.0f - a1 - a2;
-		const float ecc = 1.0f - 3.0f * min(min(a1, a2), a3);
-		if (ecc < 0.0f || ecc > 10.0f)
-			continue;
-
-		const float power = -0.5f * pow(ecc, 2.0f * gamma);
-		const float op = opacity[global_id];
-		const float G = exp(power);
-		const float alpha = min(ALPHA_THRES, op * G);
-		if (G < G_THRES)
+		TriangleSample s;
+		if (!sampleTriangle(p_ray, s_v1_view[global_id], s_v2_view[global_id], s_v3_view[global_id], s_normal_view[global_id], gamma, ecc_max, s))
 			continue;
 
 		// Push new sample into the sort buffer
-		BlendInfo new_sample(global_id, depth);
+		BlendInfo new_sample(global_id, s.depth);
 		for (int s = 0; s < SORT_WINDOW_SIZE && new_sample.depth != FLT_MAX; ++s)
 		{
 			if (new_sample.depth < sort_buffer[s].depth)

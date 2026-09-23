@@ -16,6 +16,8 @@ from typing import NamedTuple
 import math
 import os
 
+from ..utils.camera import qvec2rotmat
+
 
 CameraModel = collections.namedtuple("CameraModel", ["model_id", "model_name", "num_params"])
 CAMERA_MODELS = {
@@ -37,36 +39,7 @@ CAMERA_MODEL_IDS = dict([(camera_model.model_id, camera_model) for camera_model 
 Camera = collections.namedtuple("Camera", ["id", "model", "width", "height", "params"])
 BaseImage = collections.namedtuple("Image", ["id", "qvec", "tvec", "camera_id", "name", "xys", "point3D_ids"])
 # Point3D = collections.namedtuple("Point3D", ["id", "xyz", "rgb", "error", "image_ids", "point2D_idxs"])
-
-
-def qvec2rotmat(q: np.ndarray) -> np.ndarray:
-    return np.array(
-        [
-            [1 - 2 * q[2] ** 2 - 2 * q[3] ** 2, 2 * q[1] * q[2] - 2 * q[0] * q[3], 2 * q[3] * q[1] + 2 * q[0] * q[2]],
-            [2 * q[1] * q[2] + 2 * q[0] * q[3], 1 - 2 * q[1] ** 2 - 2 * q[3] ** 2, 2 * q[2] * q[3] - 2 * q[0] * q[1]],
-            [2 * q[3] * q[1] - 2 * q[0] * q[2], 2 * q[2] * q[3] + 2 * q[0] * q[1], 1 - 2 * q[1] ** 2 - 2 * q[2] ** 2],
-        ]
-    )
-
-
-def rotmat2qvec(R: np.ndarray) -> np.ndarray:
-    Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = R.flat
-    K = (
-        np.array(
-            [
-                [Rxx - Ryy - Rzz, 0, 0, 0],
-                [Ryx + Rxy, Ryy - Rxx - Rzz, 0, 0],
-                [Rzx + Rxz, Rzy + Ryz, Rzz - Rxx - Ryy, 0],
-                [Ryz - Rzy, Rzx - Rxz, Rxy - Ryx, Rxx + Ryy + Rzz],
-            ]
-        )
-        / 3.0
-    )
-    eigvals, eigvecs = np.linalg.eigh(K)
-    qvec = eigvecs[[3, 0, 1, 2], np.argmax(eigvals)]
-    if qvec[0] < 0:
-        qvec *= -1
-    return qvec
+POINT2D_DTYPE = np.dtype([("xy", "<f8", 2), ("point3D_id", "<i8")])
 
 
 def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
@@ -194,10 +167,12 @@ def read_extrinsics_binary(path_to_model_file):
                 image_name += current_char.decode("utf-8")
                 current_char = read_next_bytes(fid, 1, "c")[0]
             num_points2D = read_next_bytes(fid, num_bytes=8, format_char_sequence="Q")[0]
-            x_y_id_s = read_next_bytes(fid, num_bytes=24 * num_points2D, format_char_sequence="ddq" * num_points2D)
-            xys = np.column_stack([tuple(map(float, x_y_id_s[0::3])), tuple(map(float, x_y_id_s[1::3]))])
-            point3D_ids = np.array(tuple(map(int, x_y_id_s[2::3])))
-            images[image_id] = BaseImage(id=image_id, qvec=qvec, tvec=tvec, camera_id=camera_id, name=image_name, xys=xys, point3D_ids=point3D_ids)
+            points2D = np.fromfile(fid, dtype=POINT2D_DTYPE, count=num_points2D)
+            if len(points2D) != num_points2D:
+                raise EOFError(f"Expected {num_points2D} 2D points for image {image_id}, got {len(points2D)}")
+            images[image_id] = BaseImage(
+                id=image_id, qvec=qvec, tvec=tvec, camera_id=camera_id, name=image_name, xys=points2D["xy"], point3D_ids=points2D["point3D_id"]
+            )
     return images
 
 

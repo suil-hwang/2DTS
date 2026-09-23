@@ -75,11 +75,8 @@ def _apply_normalization(values: np.ndarray, component_type: int) -> np.ndarray:
 
 
 def _read_strided_buffer(data: bytes, dtype: np.dtype, count: int, num_components: int, offset: int, stride_bytes: int) -> np.ndarray:
-    values = np.empty((count, num_components), dtype=dtype)
-    for row_idx in range(count):
-        row_offset = offset + row_idx * stride_bytes
-        values[row_idx] = np.frombuffer(data, dtype=dtype, count=num_components, offset=row_offset)
-    return values
+    values = np.ndarray((count, num_components), dtype=dtype, buffer=data, offset=offset, strides=(stride_bytes, dtype.itemsize))
+    return values.copy()
 
 
 def _reshape_accessor_values(accessor_type: str, values: np.ndarray) -> np.ndarray:

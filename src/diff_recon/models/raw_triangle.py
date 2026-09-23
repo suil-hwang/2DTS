@@ -122,7 +122,7 @@ class RawTriangle:
             return self
 
         kdTree = KDTree(other.center)
-        distance, _ = kdTree.query(self.center)
+        distance, _ = kdTree.query(self.center, workers=-1)
         self.contained_idx &= distance > 1e-5
         self.reduce()
         return self

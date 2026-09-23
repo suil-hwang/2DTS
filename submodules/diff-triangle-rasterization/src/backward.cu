@@ -125,9 +125,9 @@ __global__ void BACKWARD::preprocessCUDA(
 	const float *__restrict__ shs,
 	const int *__restrict__ radii,
 	const bool *__restrict__ clamped,
-	const float3 *__restrict__ dL_dv1_view_ptr,
-	const float3 *__restrict__ dL_dv2_view_ptr,
-	const float3 *__restrict__ dL_dv3_view_ptr,
+	const float4 *__restrict__ dL_dv1_view_ptr,
+	const float4 *__restrict__ dL_dv2_view_ptr,
+	const float4 *__restrict__ dL_dv3_view_ptr,
 	const float *__restrict__ dL_dfeature,
 	float *__restrict__ dL_dvertex,
 	float *__restrict__ dL_dshs)
@@ -137,10 +137,11 @@ __global__ void BACKWARD::preprocessCUDA(
 		return;
 
 	// Transform view-space vertex gradients back to world space.
+	const float4 g1 = dL_dv1_view_ptr[idx], g2 = dL_dv2_view_ptr[idx], g3 = dL_dv3_view_ptr[idx];
 	float3 vertex_gradients[3] = {
-		transformVec4x3Transpose(dL_dv1_view_ptr[idx], viewmatrix),
-		transformVec4x3Transpose(dL_dv2_view_ptr[idx], viewmatrix),
-		transformVec4x3Transpose(dL_dv3_view_ptr[idx], viewmatrix)};
+		transformVec4x3Transpose(make_float3(g1.x, g1.y, g1.z), viewmatrix),
+		transformVec4x3Transpose(make_float3(g2.x, g2.y, g2.z), viewmatrix),
+		transformVec4x3Transpose(make_float3(g3.x, g3.y, g3.z), viewmatrix)};
 
 	if (use_shs)
 	{
@@ -193,9 +194,9 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		const float *__restrict__ dL_dout_depth,
 		const float *__restrict__ dL_dout_normal,
 		const float *__restrict__ dL_dout_distortion,
-		float3 *__restrict__ dL_dv1_view,
-		float3 *__restrict__ dL_dv2_view,
-		float3 *__restrict__ dL_dv3_view,
+		float4 *__restrict__ dL_dv1_view,
+		float4 *__restrict__ dL_dv2_view,
+		float4 *__restrict__ dL_dv3_view,
 		float *__restrict__ dL_dfeature,
 		float *__restrict__ dL_dopacity,
 		float *__restrict__ dL_dv_norm)
@@ -208,6 +209,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	const uint2 pix = {group_index.x * BLOCK_X + thread_index.x, group_index.y * BLOCK_Y + thread_index.y};
 	const uint32_t pix_id = W * pix.y + pix.x;
 	const float3 p_ray = {tan_fovx * pixToProj((float)pix.x, W), tan_fovy * pixToProj((float)pix.y, H), 1.0f};
+	const float ecc_max = supportEcc(gamma);
 
 	const bool inside = pix.x < W && pix.y < H;
 
@@ -296,34 +298,13 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			const float3 v2_view = collected_v2_view[j];
 			const float3 v3_view = collected_v3_view[j];
 			const float3 normal_view = collected_normal_view[j];
-
-			const float p_ray_dot_n = dot(p_ray, normal_view);
-			if (abs(p_ray_dot_n) < EPS)
+			TriangleSample s;
+			if (!sampleTriangle(p_ray, v1_view, v2_view, v3_view, normal_view, gamma, ecc_max, s))
 				continue;
-			const float inv_p_ray_dot_n = 1.0f / p_ray_dot_n;
-			const float depth = dot(v1_view, normal_view) * inv_p_ray_dot_n;
-			if (depth < 0.0f)
-				continue;
+			const auto [p_v1, p_v2, p_v3, inv_p_ray_dot_n, inv_n_dot_n, depth, a1, a2, a3, ecc, power, G] = s;
 
-			const float3 p_view = depth * p_ray;
-			const float3 p_v1 = v1_view - p_view;
-			const float3 p_v2 = v2_view - p_view;
-			const float3 p_v3 = v3_view - p_view;
-
-			const float inv_n_dot_n = 1.0f / dot(normal_view, normal_view);
-			const float a1 = dot(cross(p_v2, p_v3), normal_view) * inv_n_dot_n;
-			const float a2 = dot(cross(p_v3, p_v1), normal_view) * inv_n_dot_n;
-			const float a3 = 1.0f - a1 - a2;
-			const float ecc = 1.0f - 3.0f * min(min(a1, a2), a3);
-			if (ecc < 0.0f || ecc > 10.0f)
-				continue;
-
-			const float power = -0.5f * pow(ecc, 2.0f * gamma);
 			const float op = collected_opacity[j];
-			const float G = exp(power);
 			const float alpha = min(ALPHA_THRES, op * G);
-			if (G < G_THRES)
-				continue;
 
 			T /= (1.0f - alpha);
 			const float contrib = alpha * T;
@@ -427,15 +408,9 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			dL_dv3_view_point += cross(v1_view - v2_view, dL_dnormal);
 
 			// Update gradients w.r.t. triangle vertex positions
-			atomicAdd(&dL_dv1_view[global_id].x, dL_dv1_view_point.x);
-			atomicAdd(&dL_dv1_view[global_id].y, dL_dv1_view_point.y);
-			atomicAdd(&dL_dv1_view[global_id].z, dL_dv1_view_point.z);
-			atomicAdd(&dL_dv2_view[global_id].x, dL_dv2_view_point.x);
-			atomicAdd(&dL_dv2_view[global_id].y, dL_dv2_view_point.y);
-			atomicAdd(&dL_dv2_view[global_id].z, dL_dv2_view_point.z);
-			atomicAdd(&dL_dv3_view[global_id].x, dL_dv3_view_point.x);
-			atomicAdd(&dL_dv3_view[global_id].y, dL_dv3_view_point.y);
-			atomicAdd(&dL_dv3_view[global_id].z, dL_dv3_view_point.z);
+			atomicAddVec(&dL_dv1_view[global_id], dL_dv1_view_point);
+			atomicAddVec(&dL_dv2_view[global_id], dL_dv2_view_point);
+			atomicAddVec(&dL_dv3_view[global_id], dL_dv3_view_point);
 
 			// Update gradients for densification
 			const float dL_dv_norm_point = (norm(dL_dv1_view_point) * v1_view.z + norm(dL_dv2_view_point) * v2_view.z + norm(dL_dv3_view_point) * v3_view.z) / 3.0f;
@@ -478,9 +453,9 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		const float *__restrict__ dL_dout_depth,
 		const float *__restrict__ dL_dout_normal,
 		const float *__restrict__ dL_dout_distortion,
-		float3 *__restrict__ dL_dv1_view,
-		float3 *__restrict__ dL_dv2_view,
-		float3 *__restrict__ dL_dv3_view,
+		float4 *__restrict__ dL_dv1_view,
+		float4 *__restrict__ dL_dv2_view,
+		float4 *__restrict__ dL_dv3_view,
 		float *__restrict__ dL_dfeature,
 		float *__restrict__ dL_dopacity,
 		float *__restrict__ dL_dv_norm)
@@ -495,6 +470,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		return;
 	const uint32_t pix_id = W * pix.y + pix.x;
 	const float3 p_ray = {tan_fovx * pixToProj((float)pix.x, W), tan_fovy * pixToProj((float)pix.y, H), 1.0f};
+	const float ecc_max = supportEcc(gamma);
 
 	bool done = false;
 
@@ -554,30 +530,17 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	// Blending function that blends one sample at a time
 	auto blend_one = [&]()
 	{
-		// Always blend the closest sample
+		// Always blend the closest sample; recompute it to keep each sort entry limited to triangle ID and depth.
 		const int global_id = sort_buffer[0].global_id;
-		const float depth = sort_buffer[0].depth;
-
-		// Recompute geometry to keep each sort entry limited to triangle ID and depth.
 		const float3 v1_view = s_v1_view[global_id];
 		const float3 v2_view = s_v2_view[global_id];
 		const float3 v3_view = s_v3_view[global_id];
 		const float3 normal_view = s_normal_view[global_id];
+		TriangleSample s;
+		sampleTriangle(p_ray, v1_view, v2_view, v3_view, normal_view, gamma, ecc_max, s);
+		const auto [p_v1, p_v2, p_v3, inv_p_ray_dot_n, inv_n_dot_n, depth, a1, a2, a3, ecc, power, G] = s;
 
-		const float3 p_view = depth * p_ray;
-		const float3 p_v1 = v1_view - p_view;
-		const float3 p_v2 = v2_view - p_view;
-		const float3 p_v3 = v3_view - p_view;
-
-		const float inv_n_dot_n = 1.0f / dot(normal_view, normal_view);
-		const float a1 = dot(cross(p_v2, p_v3), normal_view) * inv_n_dot_n;
-		const float a2 = dot(cross(p_v3, p_v1), normal_view) * inv_n_dot_n;
-		const float a3 = 1.0f - a1 - a2;
-		const float ecc = 1.0f - 3.0f * min(min(a1, a2), a3);
-
-		const float power = -0.5f * pow(ecc, 2.0f * gamma);
 		const float op = opacity[global_id];
-		const float G = exp(power);
 		const float alpha = min(ALPHA_THRES, op * G);
 
 		const float contrib = alpha * T;
@@ -648,7 +611,6 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 
 		const float dL_dalpha = dL_dcontrib * T;
 		const float dL_decc = dL_dalpha * dalpha_decc;
-		const float inv_p_ray_dot_n = 1.0f / dot(p_ray, normal_view);
 
 		float3 decc_da = {0, 0, 0};
 		if (a1 <= a2 && a1 <= a3)
@@ -693,15 +655,9 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		dL_dv3_view_point += cross(v1_view - v2_view, dL_dnormal);
 
 		// Update gradients w.r.t. triangle vertex positions
-		atomicAdd(&dL_dv1_view[global_id].x, dL_dv1_view_point.x);
-		atomicAdd(&dL_dv1_view[global_id].y, dL_dv1_view_point.y);
-		atomicAdd(&dL_dv1_view[global_id].z, dL_dv1_view_point.z);
-		atomicAdd(&dL_dv2_view[global_id].x, dL_dv2_view_point.x);
-		atomicAdd(&dL_dv2_view[global_id].y, dL_dv2_view_point.y);
-		atomicAdd(&dL_dv2_view[global_id].z, dL_dv2_view_point.z);
-		atomicAdd(&dL_dv3_view[global_id].x, dL_dv3_view_point.x);
-		atomicAdd(&dL_dv3_view[global_id].y, dL_dv3_view_point.y);
-		atomicAdd(&dL_dv3_view[global_id].z, dL_dv3_view_point.z);
+		atomicAddVec(&dL_dv1_view[global_id], dL_dv1_view_point);
+		atomicAddVec(&dL_dv2_view[global_id], dL_dv2_view_point);
+		atomicAddVec(&dL_dv3_view[global_id], dL_dv3_view_point);
 
 		// Update gradients for densification
 		const float dL_dv_norm_point = (norm(dL_dv1_view_point) * v1_view.z + norm(dL_dv2_view_point) * v2_view.z + norm(dL_dv3_view_point) * v3_view.z) / 3.0f;
@@ -729,38 +685,12 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	{
 		// Find the next sample to blend
 		const int global_id = point_list[i];
-		const float3 v1_view = s_v1_view[global_id];
-		const float3 v2_view = s_v2_view[global_id];
-		const float3 v3_view = s_v3_view[global_id];
-		const float3 normal_view = s_normal_view[global_id];
-
-		const float p_ray_dot_n = dot(p_ray, normal_view);
-		if (abs(p_ray_dot_n) < EPS)
-			continue;
-		const float depth = dot(v1_view, normal_view) / p_ray_dot_n;
-		if (depth < 0.0f)
-			continue;
-
-		const float3 p_view = depth * p_ray;
-		const float3 p_v1 = v1_view - p_view;
-		const float3 p_v2 = v2_view - p_view;
-		const float3 p_v3 = v3_view - p_view;
-
-		const float inv_n_dot_n = 1.0f / dot(normal_view, normal_view);
-		const float a1 = dot(cross(p_v2, p_v3), normal_view) * inv_n_dot_n;
-		const float a2 = dot(cross(p_v3, p_v1), normal_view) * inv_n_dot_n;
-		const float a3 = 1.0f - a1 - a2;
-		const float ecc = 1.0f - 3.0f * min(min(a1, a2), a3);
-		if (ecc < 0.0f || ecc > 10.0f)
-			continue;
-
-		const float power = -0.5f * pow(ecc, 2.0f * gamma);
-		const float G = exp(power);
-		if (G < G_THRES)
+		TriangleSample s;
+		if (!sampleTriangle(p_ray, s_v1_view[global_id], s_v2_view[global_id], s_v3_view[global_id], s_normal_view[global_id], gamma, ecc_max, s))
 			continue;
 
 		// Push new sample into the sort buffer
-		BlendInfo new_sample(global_id, depth);
+		BlendInfo new_sample(global_id, s.depth);
 		for (int s = 0; s < SORT_WINDOW_SIZE && new_sample.depth != FLT_MAX; ++s)
 		{
 			if (new_sample.depth < sort_buffer[s].depth)

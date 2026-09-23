@@ -26,7 +26,7 @@ python -m unittest discover -s tests -t . -v
 
 These commands fetch the submodules, create the environment, compile native dependencies, install the editable package, check dependency consistency, and run the regressions. `fused-ssim` is optional: without it SSIM falls back to PyTorch. Rebuild extensions after C++/CUDA changes. On Windows with torch 2.11 and MSVC 14.44, set `NVCC_APPEND_FLAGS=-Xcompiler /permissive- -DWIN32_LEAN_AND_MEAN` before building, or nvcc fails with `C2872: 'std': ambiguous symbol`.
 
-Training entrypoint: `python run_experiments.py --type NerfSynthetic --dataset_path ./data/nerf_synthetic --num_workers 0`. NerfSynthetic Chamfer evaluation uses libigl on the CPU. The legacy `viser_viewer.py` requires excluded Viser. Inspect logs with `tensorboard --logdir outputs`.
+Training entrypoint: `python run_experiments.py --type NerfSynthetic --dataset_path ./data/nerf_synthetic --num_workers 0`. NerfSynthetic Chamfer evaluation uses a multithreaded SciPy KD-tree on the CPU. The legacy `viser_viewer.py` requires excluded Viser. Inspect logs with `tensorboard --logdir outputs`.
 
 ## Coding Style & Naming Conventions
 

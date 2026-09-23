@@ -135,9 +135,9 @@ def get_f1_score_histo2(threshold, filename_mvs, plot_stretch, distance1, distan
     print("[get_f1_score_histo2]")
     dist_threshold = threshold
     if len(distance1) and len(distance2):
-
-        recall = float(sum(d < threshold for d in distance2)) / float(len(distance2))
-        precision = float(sum(d < threshold for d in distance1)) / float(len(distance1))
+        distance1, distance2 = np.asarray(distance1), np.asarray(distance2)
+        recall = float(np.count_nonzero(distance2 < threshold)) / len(distance2)
+        precision = float(np.count_nonzero(distance1 < threshold)) / len(distance1)
         fscore = 2 * recall * precision / (recall + precision)
         num = len(distance1)
         bins = np.arange(0, dist_threshold * plot_stretch, dist_threshold / 100)

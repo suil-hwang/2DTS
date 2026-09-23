@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import math
+from scipy.spatial.transform import Rotation
 
 
 def getWorld2ViewMatrix(R: np.ndarray, t: np.ndarray) -> np.ndarray:
@@ -35,36 +36,14 @@ def getProjectionMatrix(znear, zfar, fovX, fovY) -> torch.Tensor:
     return P
 
 
-def qvec2rotmat(q: np.ndarray) -> np.ndarray:
-    # quaternion in wxyz format
-    return np.array(
-        [
-            [1 - 2 * q[2] ** 2 - 2 * q[3] ** 2, 2 * q[1] * q[2] - 2 * q[0] * q[3], 2 * q[3] * q[1] + 2 * q[0] * q[2]],
-            [2 * q[1] * q[2] + 2 * q[0] * q[3], 1 - 2 * q[1] ** 2 - 2 * q[3] ** 2, 2 * q[2] * q[3] - 2 * q[0] * q[1]],
-            [2 * q[3] * q[1] - 2 * q[0] * q[2], 2 * q[2] * q[3] + 2 * q[0] * q[1], 1 - 2 * q[1] ** 2 - 2 * q[2] ** 2],
-        ]
-    )
+def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
+    """Convert (..., 4) wxyz (COLMAP) quaternions to (..., 3, 3) rotation matrices."""
+    return Rotation.from_quat(qvec, scalar_first=True).as_matrix()
 
 
 def rotmat2qvec(R: np.ndarray) -> np.ndarray:
-    # return quaternion in wxyz format
-    Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = R.flat
-    K = (
-        np.array(
-            [
-                [Rxx - Ryy - Rzz, 0, 0, 0],
-                [Ryx + Rxy, Ryy - Rxx - Rzz, 0, 0],
-                [Rzx + Rxz, Rzy + Ryz, Rzz - Rxx - Ryy, 0],
-                [Ryz - Rzy, Rzx - Rxz, Rxy - Ryx, Rxx + Ryy + Rzz],
-            ]
-        )
-        / 3.0
-    )
-    eigvals, eigvecs = np.linalg.eigh(K)
-    qvec = eigvecs[[3, 0, 1, 2], np.argmax(eigvals)]
-    if qvec[0] < 0:
-        qvec *= -1
-    return qvec
+    """Convert (..., 3, 3) matrices to (..., 4) wxyz (COLMAP) quaternions with w >= 0."""
+    return Rotation.from_matrix(R).as_quat(canonical=True, scalar_first=True)
 
 
 class Camera(torch.nn.Module):
@@ -99,10 +78,8 @@ class Camera(torch.nn.Module):
         if gt_image is None and (image_width is None or image_height is None):
             raise ValueError("Either image or image_width and image_height must be provided")
 
-        if gt_image is None and FoVy is None:
-            raise ValueError("Either image or FoVy must be provided")
-
-        self.gt_image = torch.tensor(gt_image).float().clamp(0.0, 1.0) if gt_image is not None else None
+        # clamp returns a new tensor, so the source array is never aliased
+        self.gt_image = torch.as_tensor(gt_image).float().clamp(0.0, 1.0) if gt_image is not None else None
         self.alpha_mask = torch.tensor(gt_alpha_mask).float() if gt_alpha_mask is not None else None
         self.image_width = image_width if image_width is not None else self.gt_image.shape[2]
         self.image_height = image_height if image_height is not None else self.gt_image.shape[1]
@@ -116,8 +93,8 @@ class Camera(torch.nn.Module):
 
         self.world_view_transform = torch.tensor(getWorld2ViewMatrix(R, T).astype(np.float32)).transpose(0, 1)
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0, 1)
-        self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
-        self.camera_center = self.world_view_transform.inverse()[3, :3]
+        self.full_proj_transform = self.world_view_transform @ self.projection_matrix
+        self.camera_center = torch.tensor(-R @ T, dtype=torch.float32)  # camera-to-world translation, rounded once from float64
         self.tan_fovx = math.tan(self.FoVx / 2)
         self.tan_fovy = math.tan(self.FoVy / 2)
 
@@ -156,9 +133,9 @@ class Camera(torch.nn.Module):
         Returns:
             pixels: (H, W, 2) tensor of pixel coordinates
         """
-        pixels = torch.stack(torch.meshgrid(torch.arange(self.image_width), torch.arange(self.image_height), indexing="xy"), dim=-1)  # (H, W, 2)
-        pixels = pixels.float().to(self.device) + 0.5  # (H, W, 2)
-        return pixels
+        x = torch.arange(self.image_width, dtype=torch.float32, device=self.device) + 0.5
+        y = torch.arange(self.image_height, dtype=torch.float32, device=self.device) + 0.5
+        return torch.stack(torch.meshgrid(x, y, indexing="xy"), dim=-1)  # (H, W, 2), pixel centers
 
     def get_rays(self, world_space: bool = False) -> torch.Tensor:
         """
@@ -169,13 +146,13 @@ class Camera(torch.nn.Module):
             rays: (H, W, 3) tensor of ray directions
         """
         pixels = self.get_pixels()  # (H, W, 2)
-        rays = pixels * torch.tensor([2 / self.image_width, 2 / self.image_height], device=self.device) - 1  # normalize to [-1, 1]
-        rays = rays * torch.tensor([self.tan_fovx, self.tan_fovy], device=self.device)  # (H, W, 2), ray direction in camera space
-        rays = torch.cat((rays, torch.ones_like(rays[..., :1])), dim=-1)  # (H, W, 3)
+        x = (pixels[..., 0] * (2 / self.image_width) - 1) * self.tan_fovx  # normalize to [-1, 1], then scale to the frustum
+        y = (pixels[..., 1] * (2 / self.image_height) - 1) * self.tan_fovy
+        rays = torch.stack((x, y, torch.ones_like(x)), dim=-1)  # (H, W, 3), camera space with z = 1
 
-        # Rotate ray directions from camera frame to the world frame
+        # Rotate ray directions from camera frame to the world frame; world_view_transform[:3, :3] stores R
         if world_space:
-            rays = rays @ torch.tensor(self.R.T).float().to(self.device)  # (H, W, 3)
+            rays = rays @ self.world_view_transform[:3, :3].T  # (H, W, 3)
 
         return rays
 
@@ -201,19 +178,15 @@ class Camera(torch.nn.Module):
         Returns:
             projected_points: (N, 3) tensor if target=="ndc" or target=="view", (N, 2) tensor if target=="screen"
         """
-        xyz1 = torch.cat([points, torch.ones_like(points[:, :1])], dim=1)  # (N, 4)
-        if target == "ndc":
-            xyzw_proj = xyz1 @ self.full_proj_transform
-            xyz_proj = xyzw_proj[:, :3] / xyzw_proj[:, 3:4]
-            return xyz_proj
-        elif target == "screen":
-            xyzw_proj = xyz1 @ self.full_proj_transform
-            xy_proj = xyzw_proj[:, :2] / xyzw_proj[:, 3:4]
-            wh = torch.tensor([self.image_width, self.image_height], device=self.device)
-            xy_pixel = (xy_proj + 1) * 0.5 * wh  # (N, 2)
-            return xy_pixel
-        elif target == "view":
-            xyz_view = (xyz1 @ self.world_view_transform)[:, :3]
-            return xyz_view
-        else:
+        # Row-vector convention: [p, 1] @ M == p @ M[:3] + M[3]
+        if target == "view":
+            return torch.addmm(self.world_view_transform[3, :3], points, self.world_view_transform[:3, :3])
+        if target not in ("ndc", "screen"):
             raise ValueError(f"Unknown target: {target}")
+
+        xyzw_proj = torch.addmm(self.full_proj_transform[3], points, self.full_proj_transform[:3])
+        xyz_proj = xyzw_proj[:, :3] / xyzw_proj[:, 3:4]
+        if target == "ndc":
+            return xyz_proj
+        x, y = ((xyz_proj[:, :2] + 1) * 0.5).unbind(dim=1)
+        return torch.stack((x * self.image_width, y * self.image_height), dim=1)  # (N, 2) pixel coordinates

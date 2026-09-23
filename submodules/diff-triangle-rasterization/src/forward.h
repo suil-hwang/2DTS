@@ -28,7 +28,8 @@ namespace FORWARD
 		bool *__restrict__ s_clamped,
 		uint32_t *__restrict__ s_tiles_touched,
 		uint2 *__restrict__ s_rect_min,
-		uint2 *__restrict__ s_rect_max);
+		uint2 *__restrict__ s_rect_max,
+		float2 *__restrict__ s_support_2D);
 
 	__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 		renderCUDA(

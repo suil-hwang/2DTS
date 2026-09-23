@@ -52,6 +52,7 @@ namespace Params
 		uint32_t* tiles_touched;
         uint2* rect_min;
         uint2* rect_max;
+		float2* support_2D;
 		size_t scan_size;
 		char* scanning_space;
 
@@ -87,6 +88,7 @@ namespace Params
 			obtain(chunk, tiles_touched, P, 128);
             obtain(chunk, rect_min, P, 128);
             obtain(chunk, rect_max, P, 128);
+			obtain(chunk, support_2D, 3 * P, 128);
 			cub::DeviceScan::InclusiveSum(nullptr, scan_size, tiles_touched, tiles_touched, P);
 			obtain(chunk, scanning_space, scan_size, 128);
 		}

@@ -227,6 +227,7 @@ __global__ void duplicateWithKeysPerTileDepth(
 	const float3 *__restrict__ s_v3_view,
 	const float3 *__restrict__ s_normal_view,
 	const float *__restrict__ projmatrix,
+	const float2 *support_2D,
 	uint64_t *point_list_keys_unsorted,
 	uint32_t *point_list_values_unsorted)
 {
@@ -240,6 +241,7 @@ __global__ void duplicateWithKeysPerTileDepth(
 	uint2 cur_rect_min = rect_min[idx];
 	uint2 cur_rect_max = rect_max[idx];
 	uint32_t cur_offset = (idx == 0) ? 0 : offsets[idx - 1];
+	const bool all_tiles = tiles_touched[idx] == (cur_rect_max.x - cur_rect_min.x) * (cur_rect_max.y - cur_rect_min.y);
 
 	const float3 v1_view = s_v1_view[idx];
 	const float3 v2_view = s_v2_view[idx];
@@ -247,7 +249,7 @@ __global__ void duplicateWithKeysPerTileDepth(
 	const float3 normal_view = s_normal_view[idx];
 	const float3 center_view = (v1_view + v2_view + v3_view) / 3.0f;
 
-	const float ecc_thres = pow(-2.0f * log(G_THRES), 0.5f / gamma);
+	const float ecc_thres = supportEcc(gamma);
 	const bool crosses_camera =
 		center_view.z + ecc_thres * (v1_view.z - center_view.z) <= EPS ||
 		center_view.z + ecc_thres * (v2_view.z - center_view.z) <= EPS ||
@@ -267,10 +269,12 @@ __global__ void duplicateWithKeysPerTileDepth(
 	// The key is | tile ID | depth |, and the value is the ID of the triangle.
 	// Sorting the values with this key yields triangle IDs in a list,
 	// such that they are first sorted by tile and then by depth.
-	for (int y = cur_rect_min.y; y < cur_rect_max.y; y++)
+	for (uint32_t y = cur_rect_min.y; y < cur_rect_max.y; y++)
 	{
-		for (int x = cur_rect_min.x; x < cur_rect_max.x; x++)
+		for (uint32_t x = cur_rect_min.x; x < cur_rect_max.x; x++)
 		{
+			if (!all_tiles && !triangleOverlapsTile(support_2D + 3 * idx, x, y, W, H))
+				continue;
 			float cur_depth = depth[idx];
 			const float2 bbox_min = make_float2(x * BLOCK_X - 0.5f, y * BLOCK_Y - 0.5f);
 			const float2 bbox_max = make_float2(min((x + 1) * BLOCK_X - 0.5f, W - 0.5f), min((y + 1) * BLOCK_Y - 0.5f, H - 0.5f));
@@ -289,12 +293,13 @@ __global__ void duplicateWithKeysPerTileDepth(
 }
 
 __global__ void duplicateWithKeys(
-	int P, dim3 grid,
+	int P, dim3 grid, int W, int H,
 	const uint32_t *tiles_touched,
 	const uint2 *rect_min,
 	const uint2 *rect_max,
 	const float *depth,
 	const uint32_t *offsets,
+	const float2 *support_2D,
 	uint64_t *point_list_keys_unsorted,
 	uint32_t *point_list_values_unsorted)
 {
@@ -310,15 +315,18 @@ __global__ void duplicateWithKeys(
 	float cur_depth = depth[idx];
 	cur_depth = max(cur_depth, 0.0f);
 	uint32_t cur_offset = (idx == 0) ? 0 : offsets[idx - 1];
+	const bool all_tiles = tiles_touched[idx] == (cur_rect_max.x - cur_rect_min.x) * (cur_rect_max.y - cur_rect_min.y);
 
-	// For each tile that the bounding rect overlaps, emit a key/value pair.
+	// For each tile that the support reaches (as counted in preprocess), emit a key/value pair.
 	// The key is | tile ID | depth |, and the value is the ID of the triangle.
 	// Sorting the values with this key yields triangle IDs in a list,
 	// such that they are first sorted by tile and then by depth.
-	for (int y = cur_rect_min.y; y < cur_rect_max.y; y++)
+	for (uint32_t y = cur_rect_min.y; y < cur_rect_max.y; y++)
 	{
-		for (int x = cur_rect_min.x; x < cur_rect_max.x; x++)
+		for (uint32_t x = cur_rect_min.x; x < cur_rect_max.x; x++)
 		{
+			if (!all_tiles && !triangleOverlapsTile(support_2D + 3 * idx, x, y, W, H))
+				continue;
 			uint64_t key = y * grid.x + x;
 			key <<= 32;
 			key |= *((uint32_t *)&cur_depth);
@@ -391,7 +399,8 @@ void Rasterizer::forward(
 		geometryState.clamped,
 		geometryState.tiles_touched,
 		geometryState.rect_min,
-		geometryState.rect_max);
+		geometryState.rect_max,
+		geometryState.support_2D);
 	CHECK_CUDA(debug);
 
 #ifdef DEBUG
@@ -452,12 +461,13 @@ void Rasterizer::forward(
 	if (sort_level == 0)
 	{
 		duplicateWithKeys<<<(P + 255) / 256, 256, 0, stream>>>(
-			P, grid,
+			P, grid, W, H,
 			geometryState.tiles_touched,
 			geometryState.rect_min,
 			geometryState.rect_max,
 			geometryState.depth,
 			geometryState.point_offsets,
+			geometryState.support_2D,
 			binningState.point_list_keys_unsorted,
 			binningState.point_list_unsorted);
 	}
@@ -475,6 +485,7 @@ void Rasterizer::forward(
 			geometryState.v3_view,
 			geometryState.normal_view,
 			cameraInfo.projmatrix,
+			geometryState.support_2D,
 			binningState.point_list_keys_unsorted,
 			binningState.point_list_unsorted);
 	}
@@ -603,13 +614,14 @@ void Rasterizer::backward(
 	Params::ImageState imageState(backwardInput.imageBuffer, (size_t)(W * H));
 
 	auto float_opts = backwardInput.geometryBuffer.options().dtype(torch::kFloat32);
-	torch::Tensor dL_dv1_view = torch::zeros({P, 3}, float_opts);
-	torch::Tensor dL_dv2_view = torch::zeros({P, 3}, float_opts);
-	torch::Tensor dL_dv3_view = torch::zeros({P, 3}, float_opts);
+	// float4-padded so each pixel adds a vertex gradient with one vector atomic.
+	torch::Tensor dL_dv1_view = torch::zeros({P, 4}, float_opts);
+	torch::Tensor dL_dv2_view = torch::zeros({P, 4}, float_opts);
+	torch::Tensor dL_dv3_view = torch::zeros({P, 4}, float_opts);
 
-	float3 *dL_dv1_view_ptr = (float3 *)dL_dv1_view.data_ptr<float>();
-	float3 *dL_dv2_view_ptr = (float3 *)dL_dv2_view.data_ptr<float>();
-	float3 *dL_dv3_view_ptr = (float3 *)dL_dv3_view.data_ptr<float>();
+	float4 *dL_dv1_view_ptr = (float4 *)dL_dv1_view.data_ptr<float>();
+	float4 *dL_dv2_view_ptr = (float4 *)dL_dv2_view.data_ptr<float>();
+	float4 *dL_dv3_view_ptr = (float4 *)dL_dv3_view.data_ptr<float>();
 
 	const float *feature = geometryInfo.use_shs ? (float *)geometryState.rgb : geometryInfo.feature;
 	if (sort_level <= 1)

@@ -1,11 +1,10 @@
 import numpy as np
 from pathlib import Path
 from scipy.spatial.transform import Rotation
-from scipy.spatial.transform import Slerp
 from scipy.spatial.distance import cdist
 
 from .colmap_loader import CameraInfo
-from ..utils.camera import rotmat2qvec, qvec2rotmat
+from ..utils.camera import rotmat2qvec
 from ..models.point_cloud import PointCloud
 
 
@@ -21,8 +20,9 @@ def camInfosToColmap(cam_infos: list[CameraInfo], save_dir: str) -> None:
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
     cam_dict = {}
+    quats = rotmat2qvec(np.array([cam.R.T for cam in cam_infos]).reshape(-1, 3, 3))  # world-to-camera, as COLMAP stores it
     with open(f"{save_dir}/images.txt", "w", encoding="utf-8") as f_images:
-        for i, cam in enumerate(cam_infos):
+        for i, (cam, quat) in enumerate(zip(cam_infos, quats)):
             width, height = cam.width, cam.height
             f = 0.5 * height / np.tan(0.5 * cam.FovY)
             if cam.camera_id in cam_dict:
@@ -30,8 +30,6 @@ def camInfosToColmap(cam_infos: list[CameraInfo], save_dir: str) -> None:
                     raise ValueError(f"Camera ID {cam.camera_id} has inconsistent parameters: {cam_dict[cam.camera_id]} vs ({width}, {height}, {f})")
             else:
                 cam_dict[cam.camera_id] = (width, height, f)
-
-            quat = rotmat2qvec(cam.R.T)
 
             f_images.write(f"{i} {quat[0]} {quat[1]} {quat[2]} {quat[3]} {cam.T[0]} {cam.T[1]} {cam.T[2]} {cam.camera_id} {cam.image_name}\n\n")
 
@@ -111,12 +109,8 @@ def interpolateCameraInfos(
     s_positions = np.array([-cam.R @ cam.T for cam in source_cam_infos])  # Camera centers in world coordinates
     t_positions = np.array([-cam.R @ cam.T for cam in target_cam_infos])
 
-    s_Rs = np.array([cam.R for cam in source_cam_infos])
+    s_Rs = np.array([cam.R for cam in source_cam_infos])  # Camera to world rotation
     t_Rs = np.array([cam.R for cam in target_cam_infos])
-
-    # Convert rotation matrices to scipy Rotation objects for SLERP
-    s_rotations = [Rotation.from_matrix(R) for R in s_Rs]  # Camera to world rotation
-    t_rotations = [Rotation.from_matrix(R) for R in t_Rs]
 
     # Find closest source camera for each target camera
     if ground_z is not None:
@@ -131,44 +125,26 @@ def interpolateCameraInfos(
     blend_dist = position_dist / 200 + rotation_dist
     closest_source_indices = np.argmin(blend_dist, axis=1)
 
-    interpolated_cam_infos = []
-
-    # Create interpolation weights
+    # Interpolate all targets at once per step: SLERP (as scipy's Slerp does) for rotation, LERP for camera center
     alphas = np.sqrt(np.linspace(0, 1, num_interp + 1)[1:])
+    source_rots = Rotation.from_matrix(s_Rs[closest_source_indices])
+    rel_rotvecs = (source_rots.inv() * Rotation.from_matrix(t_Rs)).as_rotvec()  # shortest arc from each source to its target
+    interp_Rs = np.stack([(source_rots * Rotation.from_rotvec(alpha * rel_rotvecs)).as_matrix() for alpha in alphas])  # (num_interp, N, 3, 3)
+    interp_positions = (1 - alphas)[:, None, None] * s_positions[closest_source_indices] + alphas[:, None, None] * t_positions
+    interp_Ts = -np.einsum("jnki,jnk->jni", interp_Rs, interp_positions)  # T = -R^T @ camera center
 
-    for j, alpha in enumerate(alphas):
-        for i, target_cam in enumerate(target_cam_infos):
-            closest_source_idx = closest_source_indices[i]
-
-            # Get positions and rotations for interpolation
-            source_pos = s_positions[closest_source_idx]
-            target_pos = t_positions[i]
-            source_rot = s_rotations[closest_source_idx]
-            target_rot = t_rotations[i]
-
-            # Interpolate position
-            interp_pos = (1 - alpha) * source_pos + alpha * target_pos
-
-            # Interpolate rotation using SLERP
-            slerp = Slerp([0, 1], Rotation.concatenate([source_rot, target_rot]))
-            interp_rot = slerp(alpha)
-
-            # Convert back to camera coordinate system
-            R_cam_to_world = interp_rot.as_matrix()
-            T_cam = -R_cam_to_world.T @ interp_pos
-
-            # Create interpolated camera info
-            interp_cam_info = CameraInfo(
-                camera_id=0,
-                R=R_cam_to_world,
-                T=T_cam,
-                FovY=target_cam.FovY,
-                FovX=target_cam.FovX,
-                image_path=None,
-                image_name=f"interp_{j:02d}_{i:04d}",
-                width=target_cam.width,
-                height=target_cam.height,
-            )
-            interpolated_cam_infos.append(interp_cam_info)
-
-    return interpolated_cam_infos
+    return [
+        CameraInfo(
+            camera_id=0,
+            R=interp_Rs[j, i],
+            T=interp_Ts[j, i],
+            FovY=target_cam.FovY,
+            FovX=target_cam.FovX,
+            image_path=None,
+            image_name=f"interp_{j:02d}_{i:04d}",
+            width=target_cam.width,
+            height=target_cam.height,
+        )
+        for j in range(num_interp)
+        for i, target_cam in enumerate(target_cam_infos)
+    ]

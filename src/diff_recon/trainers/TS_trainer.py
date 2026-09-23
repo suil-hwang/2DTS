@@ -1,6 +1,7 @@
 import os
 import shutil
 import time
+import traceback
 
 import numpy as np
 import torch
@@ -307,6 +308,7 @@ class TSTrainer:
             psnr_vals.append(psnr(image, gt_image, camera.alpha_mask if eval_alpha_mask else None))
             ssim_vals.append(self.ssimLoss(image, gt_image))
             lpips_vals.append(self.lpips(image.unsqueeze(0), gt_image.unsqueeze(0)))
+            self.lpips.reset()
 
             if use_tensorboard and i in self._save_img_idx:
                 img_log_idx = self._save_img_idx.index(i)
@@ -448,6 +450,8 @@ class TSTrainer:
             self._train()
         except Exception as e:
             self.logger.error(f"Training failed: {e}")
+            # Frame locals would keep the dataset alive until exit, where each persistent loader worker waits 5 s.
+            traceback.clear_frames(e.__traceback__)
             del self.dataset
             raise
 

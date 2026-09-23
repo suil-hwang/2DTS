@@ -32,20 +32,21 @@ class BaseDatasetFactory(abc.ABC):
             return []
 
         num_workers = self._num_workers if num_workers is None else num_workers
-        return iter(
-            DataLoader(
-                dataset,
-                batch_size=None,
-                shuffle=shuffle,
-                num_workers=num_workers,
-                pin_memory=True,
-                collate_fn=nop,  # can't use lambda x: x because of pickling error when using "spawn" start method
-                prefetch_factor=10 if num_workers > 0 else None,
-            )
+        return DataLoader(
+            dataset,
+            batch_size=None,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=nop, 
+            prefetch_factor=10 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,  
         )
 
     def getTrainDataset(self) -> DataLoader:
-        return self._getDataLoader(self._train_dataset)
+        if not hasattr(self, "_train_loader"):
+            self._train_loader = self._getDataLoader(self._train_dataset)
+        return iter(self._train_loader)
 
     def getTrainDatasetSize(self) -> int:
         return len(self._train_dataset)
@@ -65,7 +66,9 @@ class BaseDatasetFactory(abc.ABC):
         return data
 
     def getTestDataset(self) -> DataLoader:
-        return self._getDataLoader(self._test_dataset, shuffle=False)
+        if not hasattr(self, "_test_loader"):
+            self._test_loader = self._getDataLoader(self._test_dataset, shuffle=False)
+        return iter(self._test_loader)
 
     def getTestDatasetSize(self) -> int:
         return len(self._test_dataset)

@@ -1,7 +1,7 @@
 import argparse
 
-import igl
 import numpy as np
+from scipy.spatial import KDTree
 from scipy.spatial.transform import Rotation as Rot
 import trimesh
 import json
@@ -23,12 +23,9 @@ def sample_mesh(m, n):
 
 
 def _mean_squared_point_distance(query, reference):
-    # Keep sampled-point Chamfer: one index per primitive, not triangle faces.
-    point_indices = np.arange(len(reference), dtype=np.int64)[:, None]
-    squared, _, _ = igl.point_mesh_squared_distance(
-        np.asarray(query, dtype=np.float64), np.asarray(reference, dtype=np.float64), point_indices
-    )
-    return float(squared.mean())
+    # Keep sampled-point Chamfer: nearest sampled point, not the nearest triangle face.
+    distances, _ = KDTree(np.asarray(reference, dtype=np.float64)).query(np.asarray(query, dtype=np.float64), workers=-1)
+    return float(np.mean(distances**2))
 
 
 def eval_nerf_synthetic(mesh_path, ref_path, n_sample, output_dir=None):

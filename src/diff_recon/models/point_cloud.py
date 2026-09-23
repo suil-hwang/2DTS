@@ -48,7 +48,8 @@ class PointCloud:
 
         elements = np.empty(xyz.shape[0], dtype=dtype)
         attributes = np.concatenate((xyz, normals, rgb), axis=1)
-        elements[:] = list(map(tuple, attributes))
+        for column, name in enumerate(elements.dtype.names):
+            elements[name] = attributes[:, column]
 
         # Create the PlyData object and write to file
         vertex_element = PlyElement.describe(elements, "vertex")

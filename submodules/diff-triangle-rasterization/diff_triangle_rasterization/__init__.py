@@ -103,8 +103,6 @@ class _RasterizeTriangles(torch.autograd.Function):
         ctx.save_for_backward(vertex, shs, feature, opacity, radii, out_feature, depth, normal, distortion, geometryBuffer, binningBuffer, imageBuffer)
 
         alpha_mask = 1 - final_Ts
-        if (n_contribs < 0).any():
-            raise ValueError("n_contribs has negative values, indicating an integer overflow.")
 
         if raster_settings.rich_info:
             return out_feature, radii, depth, normal, distortion, contrib_sum, contrib_max, n_contribs, alpha_mask, num_rendered
