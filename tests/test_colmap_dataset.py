@@ -6,10 +6,13 @@ from argparse import Namespace
 from pathlib import Path
 
 import numpy as np
+import torch
+from PIL import Image
 from scipy.spatial.transform import Rotation
 
-from src.diff_recon.datasets.Colmap_dataset import ColmapDataset
+from src.diff_recon.datasets.Colmap_dataset import ColmapDataset, ColmapDatasetFactory, DeviceColmapDataset
 from src.diff_recon.datasets.colmap_loader import CameraInfo, read_extrinsics_binary, read_extrinsics_text, readColmapCameras
+from src.diff_recon.utils.file_handler import LocalHandler
 
 
 def make_cam(center, R=np.eye(3)) -> CameraInfo:
@@ -124,6 +127,69 @@ class ColmapBinaryModelTest(unittest.TestCase):
             np.testing.assert_array_equal(cam_bin.T, cam_txt.T)
             self.assertEqual((cam_bin.FovX, cam_bin.FovY), (cam_txt.FovX, cam_txt.FovY))
         self.assertAlmostEqual(binary[0].FovY, 2 * math.atan(300 / 410))
+
+
+class DeviceColmapDatasetTest(unittest.TestCase):
+    """DeviceColmapDataset must hand out exactly what ColmapDataset does for the same background."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        rng = np.random.default_rng(0)
+        Image.fromarray(rng.integers(0, 256, (6, 8, 4), dtype=np.uint8), "RGBA").save(root / "rgba.png")
+        Image.fromarray(rng.integers(0, 256, (6, 8, 3), dtype=np.uint8), "RGB").save(root / "rgb.png")
+        self.handler = LocalHandler(str(root))
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def datasets(self, background, image_paths=("rgba.png",)):
+        cams = [make_cam([0.5 * i, 0.0, -2.0])._replace(image_path=path, width=None, height=None) for i, path in enumerate(image_paths)]
+        dataset = ColmapDataset(self.handler, cams, background=background, znear=0.01)
+        return dataset, DeviceColmapDataset(dataset, self.device)
+
+    def assert_same_item(self, dataset, device_dataset, bg_color=None):
+        if bg_color is not None:  # both draw this background
+            dataset._get_bg_color = lambda: bg_color
+            device_dataset._get_bg_color = lambda: torch.tensor(bg_color, device=self.device)
+        expected, actual = dataset[0], device_dataset[0]
+        for name in ("gt_image", "alpha_mask", "bg_color", "world_view_transform", "projection_matrix", "full_proj_transform", "camera_center"):
+            value, reference = getattr(actual, name), getattr(expected, name)
+            if reference is None:
+                self.assertIsNone(value, name)
+                continue
+            self.assertEqual(value.device.type, self.device.type, name)
+            self.assertTrue(torch.equal(value.cpu(), reference), name)
+        self.assertEqual((actual.image_width, actual.image_height, actual.tan_fovx, actual.tan_fovy),
+                         (expected.image_width, expected.image_height, expected.tan_fovx, expected.tan_fovy))
+
+    def test_items_match_colmap_dataset_bit_for_bit(self):
+        for image_path in ("rgba.png", "rgb.png"):
+            for background in (None, "white", "black"):
+                with self.subTest(image=image_path, background=background):
+                    self.assert_same_item(*self.datasets(background, (image_path,)))
+            with self.subTest(image=image_path, background="random"):
+                self.assert_same_item(*self.datasets("random", (image_path,)), bg_color=np.random.default_rng(1).random(3))
+
+    def test_random_background_is_redrawn_per_item(self):
+        _, device_dataset = self.datasets("random")
+        first, second = device_dataset[0].bg_color, device_dataset[0].bg_color
+        self.assertFalse(torch.equal(first, second))
+        self.assertTrue(((first >= 0) & (first < 1)).all().item())
+
+    def test_factory_serves_device_cameras_without_workers(self):
+        factory = ColmapDatasetFactory.__new__(ColmapDatasetFactory)
+        factory._train_dataset, _ = self.datasets("random", ("rgba.png", "rgb.png"))
+        factory._test_dataset, _ = self.datasets("white")
+        factory._num_workers, factory._pin_memory = 10, True
+        factory.cacheOnDevice(self.device)
+
+        uids = [factory.nextTrainData().uid for _ in range(6)]  # three epochs of two views
+        self.assertEqual([sorted(uids[i : i + 2]) for i in range(0, 6, 2)], [[0, 1]] * 3)
+        test_cams = list(factory.getTestDataset())
+        self.assertEqual(len(test_cams), 1)
+        self.assertEqual(test_cams[0].gt_image.device.type, self.device.type)
 
 
 if __name__ == "__main__":

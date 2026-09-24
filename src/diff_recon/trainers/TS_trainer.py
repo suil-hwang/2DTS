@@ -50,6 +50,8 @@ class TSTrainer:
         torch.autograd.set_detect_anomaly(detect_anomaly)
 
         self.dataset = self._load_dataset()
+        if self.config.dataset.cache_on_device:
+            self.dataset.cacheOnDevice(self.device)
 
         # Initialize model
         train_size = self.dataset.getTrainDatasetSize()

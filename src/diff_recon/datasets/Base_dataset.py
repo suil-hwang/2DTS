@@ -17,6 +17,7 @@ class BaseDatasetFactory(abc.ABC):
         self._logger = logger if logger is not None else stdout_logger
 
         self._num_workers = config.num_workers if config.num_workers is not None else 1
+        self._pin_memory = True
 
         self._train_dataset: Dataset = None
         self._test_dataset: Dataset = None
@@ -37,7 +38,7 @@ class BaseDatasetFactory(abc.ABC):
             batch_size=None,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=self._pin_memory,
             collate_fn=nop, 
             prefetch_factor=10 if num_workers > 0 else None,
             persistent_workers=num_workers > 0,  

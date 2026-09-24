@@ -1,4 +1,7 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
+from copy import copy
+import torch
 from torch.utils.data import Dataset
 import numpy as np
 from PIL import Image
@@ -32,6 +35,11 @@ def solve_target_res(target_res: int | list[int] | None, orig_w: int, orig_h: in
         raise ValueError("target_res must be either an int of scale ratio or a list of [width, height]")
 
     return w, h
+
+
+def normalize_image(image: np.ndarray) -> np.ndarray:
+    """uint8 (H, W, C) image -> float32 (C, H, W) in [0, 1]."""
+    return np.ascontiguousarray(image.astype(np.float32).transpose(2, 0, 1) / 255.0)
 
 
 class ColmapDataset(Dataset):
@@ -85,13 +93,8 @@ class ColmapDataset(Dataset):
             raise ValueError("dataset background must be either 'white', 'black', 'random' or None")
         return bg_color
 
-    def _get_image(self, image_path: str) -> np.ndarray:
-        """
-        Load, resize and normalize the image
-        :param image_path: Path to the image
-        :param img_size: Target size (W, H)
-        :return: Normalized image as a numpy array of shape (3, H, W) or (4, H, W)
-        """
+    def _load_image(self, image_path: str) -> np.ndarray:
+        """Load and resize the image: uint8 array of shape (H, W, 3) or (H, W, 4), or None without a path."""
         if image_path is None:
             return None
 
@@ -105,19 +108,22 @@ class ColmapDataset(Dataset):
         image = Image.open(self.file_handler.getFilePath(image_path))
         img_size = solve_target_res(self.target_res, image.width, image.height)
         image = image.resize(img_size, Image.Resampling.BILINEAR)
-        image_array = np.array(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
+        image_array = np.array(image)
         image.close()
-        return np.ascontiguousarray(image_array)
+        return image_array
+
+    def _get_image(self, image_path: str) -> np.ndarray:
+        """Load, resize and normalize the image: float32 array of shape (3, H, W) or (4, H, W) in [0, 1]."""
+        image = self._load_image(image_path)
+        return None if image is None else normalize_image(image)
 
     def __len__(self):
         return len(self.cam_infos)
 
-    def _get_item(self, idx: int) -> Camera:
+    def _get_item(self, idx: int, gt_image_array: np.ndarray = None) -> Camera:
         cam_info: CameraInfo = self.cam_infos[idx]
-        if hasattr(self, "_prefetched_imgs"):
-            gt_image_array = self._prefetched_imgs[idx]
-        else:
-            gt_image_array = self._get_image(cam_info.image_path)
+        if gt_image_array is None:
+            gt_image_array = self._prefetched_imgs[idx] if hasattr(self, "_prefetched_imgs") else self._get_image(cam_info.image_path)
         bg_color = self._get_bg_color()
 
         if gt_image_array is not None and gt_image_array.shape[0] == 4:
@@ -152,6 +158,55 @@ class ColmapDataset(Dataset):
             neighbor_cam_id = np.random.choice(self._neighbor_cams[idx])
             camera.neighbor_cam = self._get_item(neighbor_cam_id)
             camera.neighbor_cam.bg_color = camera.bg_color  # ensure same bg color for neighbor cam when using random bg
+        return camera
+
+
+class DeviceColmapDataset(Dataset):
+    """A ColmapDataset served from `device`: each image is decoded once and kept there as uint8."""
+
+    def __init__(self, dataset: ColmapDataset, device: torch.device):
+        if hasattr(dataset, "_neighbor_cams"):
+            raise ValueError("cache_on_device does not support neighbor cameras")
+        self.background = dataset.background
+        self.device = device
+        # uint8 -> [0, 1] exactly as normalize_image computes it; CUDA divides by a scalar through its reciprocal
+        self.unit_values = torch.from_numpy(normalize_image(np.arange(256, dtype=np.uint8).reshape(1, -1, 1)).ravel()).to(device)
+
+        def load(idx: int):  # decode and build the camera on the CPU; images are independent, so threads overlap them
+            image = dataset._load_image(dataset.cam_infos[idx].image_path)
+            camera = dataset._get_item(idx, None if image is None else normalize_image(image))
+            camera.gt_image = camera.alpha_mask = None  # redrawn per item from the uint8 image
+            return image, camera
+
+        with ThreadPoolExecutor() as pool:
+            loaded = list(pool.map(load, range(len(dataset))))
+        self.cameras = [camera.to(device) for _, camera in loaded]
+        self.images = [None if image is None else torch.from_numpy(image).to(device).permute(2, 0, 1) for image, _ in loaded]
+
+    def __len__(self):
+        return len(self.cameras)
+
+    def _get_bg_color(self) -> torch.Tensor:
+        if self.background is None:
+            return None
+        if self.background == "random":
+            return torch.rand(3, dtype=torch.float64, device=self.device)
+        return torch.full((3,), {"white": 1.0, "black": 0.0}[self.background], dtype=torch.float64, device=self.device)
+
+    def __getitem__(self, idx: int) -> Camera:
+        camera = copy(self.cameras[idx])
+        if self.images[idx] is None:
+            return camera
+        gt_image = self.unit_values[self.images[idx].int()]
+        bg_color = self._get_bg_color()
+        alpha_mask = None
+        if gt_image.shape[0] == 4:
+            gt_image, alpha_mask = gt_image[:3], gt_image[3]
+            if bg_color is not None:
+                gt_image = ((gt_image * alpha_mask).double() + bg_color.view(3, 1, 1) * (1 - alpha_mask).double()).float()
+        camera.gt_image = gt_image.clamp(0.0, 1.0)
+        camera.alpha_mask = alpha_mask
+        camera.bg_color = None if bg_color is None else bg_color.float()
         return camera
 
 
@@ -252,6 +307,13 @@ class ColmapDatasetFactory(BaseDatasetFactory):
             raise ValueError(f"Unsupported point cloud file format: {pcd_path.split('.')[-1]}")
 
         return pcd
+
+    def cacheOnDevice(self, device: torch.device):
+        """Serve train and test cameras from `device` (DeviceColmapDataset) through worker-free loaders."""
+        self._train_dataset = DeviceColmapDataset(self._train_dataset, device)
+        self._test_dataset = DeviceColmapDataset(self._test_dataset, device)
+        self._num_workers = 0
+        self._pin_memory = False
 
     def getCameraInfos(self) -> tuple[list[CameraInfo], list[CameraInfo]]:
         if not hasattr(self, "_cam_infos") or self._cam_infos is None:

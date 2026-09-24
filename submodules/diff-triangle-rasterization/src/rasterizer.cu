@@ -215,83 +215,6 @@ __device__ float getLowestEcc(
 	return lowest_ecc;
 }
 
-__global__ void duplicateWithKeysPerTileDepth(
-	int P, dim3 grid, int W, int H, float tan_fovx, float tan_fovy, float gamma,
-	const uint32_t *tiles_touched,
-	const uint2 *rect_min,
-	const uint2 *rect_max,
-	const float *depth,
-	const uint32_t *offsets,
-	const float3 *__restrict__ s_v1_view,
-	const float3 *__restrict__ s_v2_view,
-	const float3 *__restrict__ s_v3_view,
-	const float3 *__restrict__ s_normal_view,
-	const float *__restrict__ projmatrix,
-	const float2 *support_2D,
-	uint64_t *point_list_keys_unsorted,
-	uint32_t *point_list_values_unsorted)
-{
-	auto idx = cg::this_grid().thread_rank();
-	if (idx >= P)
-		return;
-
-	if (tiles_touched[idx] <= 0)
-		return;
-
-	uint2 cur_rect_min = rect_min[idx];
-	uint2 cur_rect_max = rect_max[idx];
-	uint32_t cur_offset = (idx == 0) ? 0 : offsets[idx - 1];
-	const bool all_tiles = tiles_touched[idx] == (cur_rect_max.x - cur_rect_min.x) * (cur_rect_max.y - cur_rect_min.y);
-
-	const float3 v1_view = s_v1_view[idx];
-	const float3 v2_view = s_v2_view[idx];
-	const float3 v3_view = s_v3_view[idx];
-	const float3 normal_view = s_normal_view[idx];
-	const float3 center_view = (v1_view + v2_view + v3_view) / 3.0f;
-
-	const float ecc_thres = supportEcc(gamma);
-	const bool crosses_camera =
-		center_view.z + ecc_thres * (v1_view.z - center_view.z) <= EPS ||
-		center_view.z + ecc_thres * (v2_view.z - center_view.z) <= EPS ||
-		center_view.z + ecc_thres * (v3_view.z - center_view.z) <= EPS;
-
-	const float3 v1_proj = projectPoint(v1_view, projmatrix);
-	const float3 v2_proj = projectPoint(v2_view, projmatrix);
-	const float3 v3_proj = projectPoint(v3_view, projmatrix);
-	const float3 center_proj = projectPoint(center_view, projmatrix);
-
-	const float2 v1_2D = {projToPix(v1_proj.x, W), projToPix(v1_proj.y, H)};
-	const float2 v2_2D = {projToPix(v2_proj.x, W), projToPix(v2_proj.y, H)};
-	const float2 v3_2D = {projToPix(v3_proj.x, W), projToPix(v3_proj.y, H)};
-	const float2 center_2D = {projToPix(center_proj.x, W), projToPix(center_proj.y, H)};
-
-	// For each tile that the bounding rect overlaps, emit a key/value pair.
-	// The key is | tile ID | depth |, and the value is the ID of the triangle.
-	// Sorting the values with this key yields triangle IDs in a list,
-	// such that they are first sorted by tile and then by depth.
-	for (uint32_t y = cur_rect_min.y; y < cur_rect_max.y; y++)
-	{
-		for (uint32_t x = cur_rect_min.x; x < cur_rect_max.x; x++)
-		{
-			if (!all_tiles && !triangleOverlapsTile(support_2D + 3 * idx, x, y, W, H))
-				continue;
-			float cur_depth = depth[idx];
-			const float2 bbox_min = make_float2(x * BLOCK_X - 0.5f, y * BLOCK_Y - 0.5f);
-			const float2 bbox_max = make_float2(min((x + 1) * BLOCK_X - 0.5f, W - 0.5f), min((y + 1) * BLOCK_Y - 0.5f, H - 0.5f));
-			// Projected edges are not a conservative culling bound across the camera plane.
-			const float lowest_ecc = crosses_camera ? 0.0f : getLowestEcc(W, H, tan_fovx, tan_fovy, v1_view, v2_view, v3_view, normal_view, v1_2D, v2_2D, v3_2D, center_2D, bbox_min, bbox_max, cur_depth);
-			cur_depth = max(cur_depth, 0.0f);
-
-			uint64_t key = lowest_ecc < ecc_thres ? (y * grid.x + x) : (grid.x * grid.y); // use an invalid tile ID to indicate ignored tile
-			key <<= 32;
-			key |= *((uint32_t *)&cur_depth);
-			point_list_keys_unsorted[cur_offset] = key;
-			point_list_values_unsorted[cur_offset] = idx;
-			cur_offset++;
-		}
-	}
-}
-
 __global__ void duplicateWithKeys(
 	int P, dim3 grid, int W, int H,
 	const uint32_t *tiles_touched,
@@ -335,6 +258,63 @@ __global__ void duplicateWithKeys(
 			cur_offset++;
 		}
 	}
+}
+
+// sort_level >= 1: re-key each instance emitted by duplicateWithKeys with the depth at the triangle's lowest-eccentricity
+// point inside its tile, or park it on the invalid tile when even that point is outside the support.
+// One thread per instance, so a triangle spanning many tiles does not stall the other lanes of its warp.
+__global__ void rekeyByTileDepth(
+	int L, dim3 grid, int W, int H, float tan_fovx, float tan_fovy, float gamma,
+	const float *depth,
+	const float3 *__restrict__ s_v1_view,
+	const float3 *__restrict__ s_v2_view,
+	const float3 *__restrict__ s_v3_view,
+	const float3 *__restrict__ s_normal_view,
+	const float *__restrict__ projmatrix,
+	const uint32_t *point_list_unsorted,
+	uint64_t *point_list_keys_unsorted)
+{
+	auto i = cg::this_grid().thread_rank();
+	if (i >= L)
+		return;
+
+	const uint32_t tile = point_list_keys_unsorted[i] >> 32;
+	const uint32_t x = tile % grid.x, y = tile / grid.x;
+	const uint32_t idx = point_list_unsorted[i];
+
+	const float3 v1_view = s_v1_view[idx];
+	const float3 v2_view = s_v2_view[idx];
+	const float3 v3_view = s_v3_view[idx];
+	const float3 normal_view = s_normal_view[idx];
+	const float3 center_view = (v1_view + v2_view + v3_view) / 3.0f;
+
+	const float ecc_thres = supportEcc(gamma);
+	const bool crosses_camera =
+		center_view.z + ecc_thres * (v1_view.z - center_view.z) <= EPS ||
+		center_view.z + ecc_thres * (v2_view.z - center_view.z) <= EPS ||
+		center_view.z + ecc_thres * (v3_view.z - center_view.z) <= EPS;
+
+	const float3 v1_proj = projectPoint(v1_view, projmatrix);
+	const float3 v2_proj = projectPoint(v2_view, projmatrix);
+	const float3 v3_proj = projectPoint(v3_view, projmatrix);
+	const float3 center_proj = projectPoint(center_view, projmatrix);
+
+	const float2 v1_2D = {projToPix(v1_proj.x, W), projToPix(v1_proj.y, H)};
+	const float2 v2_2D = {projToPix(v2_proj.x, W), projToPix(v2_proj.y, H)};
+	const float2 v3_2D = {projToPix(v3_proj.x, W), projToPix(v3_proj.y, H)};
+	const float2 center_2D = {projToPix(center_proj.x, W), projToPix(center_proj.y, H)};
+
+	float cur_depth = depth[idx];
+	const float2 bbox_min = make_float2(x * BLOCK_X - 0.5f, y * BLOCK_Y - 0.5f);
+	const float2 bbox_max = make_float2(min((x + 1) * BLOCK_X - 0.5f, W - 0.5f), min((y + 1) * BLOCK_Y - 0.5f, H - 0.5f));
+	// Projected edges are not a conservative culling bound across the camera plane.
+	const float lowest_ecc = crosses_camera ? 0.0f : getLowestEcc(W, H, tan_fovx, tan_fovy, v1_view, v2_view, v3_view, normal_view, v1_2D, v2_2D, v3_2D, center_2D, bbox_min, bbox_max, cur_depth);
+	cur_depth = max(cur_depth, 0.0f);
+
+	uint64_t key = lowest_ecc < ecc_thres ? tile : (grid.x * grid.y); // use an invalid tile ID to indicate ignored tile
+	key <<= 32;
+	key |= *((uint32_t *)&cur_depth);
+	point_list_keys_unsorted[i] = key;
 }
 
 // Check keys to see if it is at the start/end of one tile's range in the full sorted list.
@@ -458,37 +438,28 @@ void Rasterizer::forward(
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key
 	// and corresponding dublicated triangle indices to be sorted
-	if (sort_level == 0)
-	{
-		duplicateWithKeys<<<(P + 255) / 256, 256, 0, stream>>>(
-			P, grid, W, H,
-			geometryState.tiles_touched,
-			geometryState.rect_min,
-			geometryState.rect_max,
+	duplicateWithKeys<<<(P + 255) / 256, 256, 0, stream>>>(
+		P, grid, W, H,
+		geometryState.tiles_touched,
+		geometryState.rect_min,
+		geometryState.rect_max,
+		geometryState.depth,
+		geometryState.point_offsets,
+		geometryState.support_2D,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_unsorted);
+	CHECK_CUDA(debug);
+	if (sort_level != 0 && num_rendered > 0)
+		rekeyByTileDepth<<<(num_rendered + 255) / 256, 256, 0, stream>>>(
+			num_rendered, grid, W, H, cameraInfo.tan_fovx, cameraInfo.tan_fovy, geometryInfo.gamma,
 			geometryState.depth,
-			geometryState.point_offsets,
-			geometryState.support_2D,
-			binningState.point_list_keys_unsorted,
-			binningState.point_list_unsorted);
-	}
-	else
-	{
-		duplicateWithKeysPerTileDepth<<<(P + 255) / 256, 256, 0, stream>>>(
-			P, grid, W, H, cameraInfo.tan_fovx, cameraInfo.tan_fovy, geometryInfo.gamma,
-			geometryState.tiles_touched,
-			geometryState.rect_min,
-			geometryState.rect_max,
-			geometryState.depth,
-			geometryState.point_offsets,
 			geometryState.v1_view,
 			geometryState.v2_view,
 			geometryState.v3_view,
 			geometryState.normal_view,
 			cameraInfo.projmatrix,
-			geometryState.support_2D,
-			binningState.point_list_keys_unsorted,
-			binningState.point_list_unsorted);
-	}
+			binningState.point_list_unsorted,
+			binningState.point_list_keys_unsorted);
 	CHECK_CUDA(debug);
 
 	int bit = getHigherMsb(grid.x * grid.y);

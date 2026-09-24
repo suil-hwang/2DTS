@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cfloat>
 #include <cmath>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -434,6 +435,40 @@ __forceinline__ __device__ bool sampleTriangle(const float3 &p_ray, const float3
 	s.G = exp2f(s.power * 1.4426950408889634f);
 	return true;
 }
+
+// A pixel's SORT_WINDOW_SIZE nearest pending hits in ascending depth; empty slots have depth FLT_MAX.
+// Every loop runs its full trip count, so the window stays in registers instead of local memory.
+struct SortWindow
+{
+	struct Hit
+	{
+		int global_id = -1;
+		float depth = FLT_MAX;
+	} hits[SORT_WINDOW_SIZE];
+	int size = 0;
+
+	__forceinline__ __device__ void push(int global_id, float depth)
+	{
+		Hit hit{global_id, depth};
+#pragma unroll
+		for (int k = 0; k < SORT_WINDOW_SIZE; k++)
+			if (hit.depth < hits[k].depth)
+				swap(hit, hits[k]);
+		size++;
+	}
+
+	// Removes the nearest hit and returns its triangle.
+	__forceinline__ __device__ int pop()
+	{
+		const int global_id = hits[0].global_id;
+#pragma unroll
+		for (int k = 1; k < SORT_WINDOW_SIZE; k++)
+			hits[k - 1] = hits[k];
+		hits[SORT_WINDOW_SIZE - 1] = Hit();
+		size--;
+		return global_id;
+	}
+};
 
 // Adds a float3 with one 16-byte vector atomic where available (sm_90+); w is padding.
 __forceinline__ __device__ void atomicAddVec(float4 *address, const float3 &value)

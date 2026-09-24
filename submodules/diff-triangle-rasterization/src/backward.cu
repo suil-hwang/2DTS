@@ -423,15 +423,6 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	}
 }
 
-struct BlendInfo
-{
-	int global_id;
-	float depth;
-
-	__device__ BlendInfo() : global_id(-1), depth(FLT_MAX) {}
-	__device__ BlendInfo(int global_id, float depth) : global_id(global_id), depth(depth) {}
-};
-
 __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	BACKWARD::renderCUDAResort(
 		int W, int H, int C, float gamma, bool rich_info, bool use_vertex_color,
@@ -464,35 +455,32 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	auto block = cg::this_thread_block();
 	dim3 group_index = block.group_index();
 	dim3 thread_index = block.thread_index();
+	auto tid = block.thread_rank();
 
 	const uint2 pix = {group_index.x * BLOCK_X + thread_index.x, group_index.y * BLOCK_Y + thread_index.y};
-	if (pix.x >= W || pix.y >= H)
-		return;
 	const uint32_t pix_id = W * pix.y + pix.x;
 	const float3 p_ray = {tan_fovx * pixToProj((float)pix.x, W), tan_fovy * pixToProj((float)pix.y, H), 1.0f};
 	const float ecc_max = supportEcc(gamma);
 
-	bool done = false;
+	// Threads outside the image still help fetch candidates.
+	const bool inside = pix.x < W && pix.y < H;
+	bool done = !inside;
 
 	// Load start/end range of IDs to process in bit sorted list.
 	const uint2 range = ranges[group_index.y * ((W + BLOCK_X - 1) / BLOCK_X) + group_index.x];
 
-	// Initialize blending variables
+	// Blending state. rest_* is what the hits not yet blended add to each output:
+	// the final output minus the front-to-back prefix blended so far.
 	float T = 1.0f;
-	float accum_feature[MAX_CHANNELS] = {0}; // Accumulated feature from front to back
-	float3 accum_normal = {0, 0, 0};		 // Accumulated normal from front to back
-	float accum_depth = 0;					 // Accumulated depth from front to back
-	float accum_distortion_grad = 0;	 	 // Accumulated distortion weight derivative from front to back
+	float rest_feature[MAX_CHANNELS] = {0};
+	float3 rest_normal = {0, 0, 0};
+	float rest_depth = 0;
+	float rest_distortion_grad = 0; // of sum(w * dD/dw) = 2 * D
 
-	// Final outputs
 	float final_weight = 0;
-	float final_feature[MAX_CHANNELS] = {0}; // Final color for this pixel
-	float3 final_normal = {0, 0, 0};		 // Final normal for this pixel
-	float final_depth = 0;					 // Final depth for this pixel
-	float depth_moment = 0;				 	 // Final weighted depth for this pixel (without background)
+	float depth_moment = 0; // Final weighted depth for this pixel (without background)
 	float mean_depth = 0;
 	float distortion_per_weight = 0;
-	float final_distort = 0;				 // Final distortion for this pixel
 
 	// Gradients of loss w.r.t. pixel outputs
 	float dL_dfeature_pixel[MAX_CHANNELS] = {0};
@@ -500,19 +488,20 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	float dL_ddepth_pixel = 0;
 	float dL_ddistortion_pixel = 0;
 
-	for (int i = 0; i < C; i++)
+	for (int i = 0; inside && i < C; i++)
 	{
-		final_feature[i] = final_features[i * H * W + pix_id];
+		rest_feature[i] = final_features[i * H * W + pix_id];
 		dL_dfeature_pixel[i] = dL_dout_feature[i * H * W + pix_id];
 	}
-	if (rich_info)
+	if (inside && rich_info)
 	{
-		final_depth = final_depths[pix_id];
+		rest_depth = final_depths[pix_id];
 		const float2 moments = distortion_moments[pix_id];
 		final_weight = moments.x;
 		depth_moment = moments.y;
-		final_normal = make_float3(final_normals[pix_id], final_normals[W * H + pix_id], final_normals[2 * W * H + pix_id]);
-		final_distort = final_distorts[pix_id];
+		rest_normal = make_float3(final_normals[pix_id], final_normals[W * H + pix_id], final_normals[2 * W * H + pix_id]);
+		const float final_distort = final_distorts[pix_id];
+		rest_distortion_grad = 2.0f * final_distort;
 		if (final_weight > 0.0f)
 		{
 			mean_depth = depth_moment / final_weight;
@@ -523,15 +512,11 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		dL_ddistortion_pixel = dL_dout_distortion[pix_id];
 	}
 
-	// Storage for sorting a small window of samples
-	BlendInfo sort_buffer[SORT_WINDOW_SIZE];
-	int sort_num = 0;
-
-	// Blending function that blends one sample at a time
-	auto blend_one = [&]()
+	// Blends the nearest pending hit, recomputing its sample rather than keeping it in the window.
+	SortWindow window;
+	auto blend_nearest = [&]()
 	{
-		// Always blend the closest sample; recompute it to keep each sort entry limited to triangle ID and depth.
-		const int global_id = sort_buffer[0].global_id;
+		const int global_id = window.pop();
 		const float3 v1_view = s_v1_view[global_id];
 		const float3 v2_view = s_v2_view[global_id];
 		const float3 v3_view = s_v3_view[global_id];
@@ -578,26 +563,25 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 				feat = feature[global_id * C + ch];
 			}
 
-			accum_feature[ch] += feat * contrib;
-			const float accum_feat_back = (final_feature[ch] - accum_feature[ch]) / test_T; // accumulated feature coming after
-			dL_dcontrib += dL_dfeat * (feat - accum_feat_back);
+			rest_feature[ch] -= feat * contrib;
+			dL_dcontrib += dL_dfeat * (feat - rest_feature[ch] / test_T);
 		}
 
 		if (rich_info)
 		{
 			const float3 normal = normal_view * sqrt(inv_n_dot_n); // normalized normal
-			
-			accum_normal += normal * contrib;
-			accum_depth += depth * contrib;
+
+			rest_normal = rest_normal - normal * contrib;
+			rest_depth -= depth * contrib;
 			// D = S * sum(w*z*z) - sum(w*z)^2, so dD/dw = S*(z-mean)^2 + D/S.
 			const float depth_delta = depth - mean_depth;
 			const float distortion_weight_grad = final_weight * depth_delta * depth_delta + distortion_per_weight;
-			accum_distortion_grad += distortion_weight_grad * contrib;
+			rest_distortion_grad -= distortion_weight_grad * contrib;
 
-			const float3 accum_normal_back = (final_normal - accum_normal) / test_T;   // accumulated normal coming after
-			const float accum_depth_back = (final_depth - accum_depth) / test_T;	   // accumulated depth coming after
-			// sum(w * dD/dw) = 2*D. Remove the prefix to recover the suffix derivative.
-			const float accum_distortion_grad_back = (2.0f * final_distort - accum_distortion_grad) / test_T;
+			// Divided by test_T, the rest is the blend of the hits behind this one.
+			const float3 accum_normal_back = rest_normal / test_T;
+			const float accum_depth_back = rest_depth / test_T;
+			const float accum_distortion_grad_back = rest_distortion_grad / test_T;
 
 			dL_dnormal += dnormvdv(normal_view, dL_dnormal_pixel * contrib); // dnormvdv expects unnormalized input
 			dL_dcontrib += dot(dL_dnormal_pixel, normal - accum_normal_back);
@@ -670,42 +654,44 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		T *= (1.0f - alpha);
 		if (T <= T_THRES)
 			done = true;
-
-		// Pop the first element
-		for (int i = 1; i < SORT_WINDOW_SIZE && sort_buffer[i - 1].depth != FLT_MAX; ++i)
-		{
-			sort_buffer[i - 1] = sort_buffer[i];
-		}
-		sort_buffer[SORT_WINDOW_SIZE - 1].depth = FLT_MAX;
-		--sort_num;
 	};
 
-	// Iterate over samples until done or range is complete
-	for (int i = range.x; !done && i < range.y; i++)
+	// Replay the forward pass's candidate loop, batch by batch through shared memory
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float3 collected_v1_view[BLOCK_SIZE];
+	__shared__ float3 collected_v2_view[BLOCK_SIZE];
+	__shared__ float3 collected_v3_view[BLOCK_SIZE];
+	__shared__ float3 collected_normal_view[BLOCK_SIZE];
+	const int rounds = (range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
+	int toDo = range.y - range.x;
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
-		// Find the next sample to blend
-		const int global_id = point_list[i];
-		TriangleSample s;
-		if (!sampleTriangle(p_ray, s_v1_view[global_id], s_v2_view[global_id], s_v3_view[global_id], s_normal_view[global_id], gamma, ecc_max, s))
-			continue;
-
-		// Push new sample into the sort buffer
-		BlendInfo new_sample(global_id, s.depth);
-		for (int s = 0; s < SORT_WINDOW_SIZE && new_sample.depth != FLT_MAX; ++s)
+		if (__syncthreads_count(done) == BLOCK_SIZE)
+			break;
+		const int progress = i * BLOCK_SIZE + tid;
+		if (range.x + progress < range.y)
 		{
-			if (new_sample.depth < sort_buffer[s].depth)
-			{
-				swap(new_sample, sort_buffer[s]);
-			}
+			const int coll_id = point_list[range.x + progress];
+			collected_id[tid] = coll_id;
+			collected_v1_view[tid] = s_v1_view[coll_id];
+			collected_v2_view[tid] = s_v2_view[coll_id];
+			collected_v3_view[tid] = s_v3_view[coll_id];
+			collected_normal_view[tid] = s_normal_view[coll_id];
 		}
-		++sort_num;
+		block.sync();
 
-		// Blend one sample if the buffer is full
-		if (sort_num == SORT_WINDOW_SIZE)
-			blend_one();
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			TriangleSample s;
+			if (!sampleTriangle(p_ray, collected_v1_view[j], collected_v2_view[j], collected_v3_view[j], collected_normal_view[j], gamma, ecc_max, s))
+				continue;
+			window.push(collected_id[j], s.depth);
+			if (window.size == SORT_WINDOW_SIZE)
+				blend_nearest();
+		}
 	}
 
-	// Blend remaining samples in the buffer
-	while (!done && sort_num > 0)
-		blend_one();
+	// Blend remaining samples in the window
+	while (!done && window.size > 0)
+		blend_nearest();
 }

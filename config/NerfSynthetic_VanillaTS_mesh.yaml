@@ -12,6 +12,7 @@ dataset:
     background: "random"
     test_background: "white"
     num_workers: 10
+    cache_on_device: True # decode images once and serve cameras from the GPU instead of loader workers
 
     pcd_path: null
     train_target_res: null

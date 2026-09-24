@@ -327,15 +327,6 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	}
 }
 
-struct BlendInfo
-{
-	int global_id;
-	float depth;
-
-	__device__ BlendInfo() : global_id(-1), depth(FLT_MAX) {}
-	__device__ BlendInfo(int global_id, float depth) : global_id(global_id), depth(depth) {}
-};
-
 __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	FORWARD::renderCUDAResort(
 		int W, int H, int C, float gamma, bool rich_info, bool use_vertex_color, bool back_culling,
@@ -387,18 +378,11 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	float accum_distort = 0.0f;
 	uint32_t n_contrib = 0;
 
-	// Storage for sorting a small window of samples
-	BlendInfo sort_buffer[SORT_WINDOW_SIZE];
-	int sort_num = 0;
-
-	// Blending function that blends one sample at a time
-	auto blend_one = [&]()
+	// Blends the nearest pending hit, recomputing its sample rather than keeping it in the window.
+	SortWindow window;
+	auto blend_nearest = [&]()
 	{
-		if (sort_num == 0)
-			return;
-
-		// Always blend the closest sample; recompute it rather than keep it in the sort buffer
-		const int global_id = sort_buffer[0].global_id;
+		const int global_id = window.pop();
 		const float3 normal_view = s_normal_view[global_id];
 		TriangleSample s;
 		sampleTriangle(p_ray, s_v1_view[global_id], s_v2_view[global_id], s_v3_view[global_id], normal_view, gamma, ecc_max, s);
@@ -430,44 +414,46 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		T *= (1.0f - alpha);
 		if (T <= T_THRES)
 			done = true;
-
-		// Pop the first element
-		for (int i = 1; i < SORT_WINDOW_SIZE && sort_buffer[i - 1].depth != FLT_MAX; ++i)
-		{
-			sort_buffer[i - 1] = sort_buffer[i];
-		}
-		sort_buffer[SORT_WINDOW_SIZE - 1].depth = FLT_MAX;
-		--sort_num;
 	};
 
-	// Iterate over samples until done or range is complete
-	for (int i = range.x; !done && i < range.y; i++)
+	// Iterate over batches of candidates, collectively fetched into shared memory, until done or range is complete
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float3 collected_v1_view[BLOCK_SIZE];
+	__shared__ float3 collected_v2_view[BLOCK_SIZE];
+	__shared__ float3 collected_v3_view[BLOCK_SIZE];
+	__shared__ float3 collected_normal_view[BLOCK_SIZE];
+	const int rounds = (range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
+	int toDo = range.y - range.x;
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
-		// Find the next sample to blend
-		const int global_id = point_list[i];
-		TriangleSample s;
-		if (!sampleTriangle(p_ray, s_v1_view[global_id], s_v2_view[global_id], s_v3_view[global_id], s_normal_view[global_id], gamma, ecc_max, s))
-			continue;
-
-		// Push new sample into the sort buffer
-		BlendInfo new_sample(global_id, s.depth);
-		for (int s = 0; s < SORT_WINDOW_SIZE && new_sample.depth != FLT_MAX; ++s)
+		if (__syncthreads_count(done) == BLOCK_SIZE)
+			break;
+		const int progress = i * BLOCK_SIZE + tid;
+		if (range.x + progress < range.y)
 		{
-			if (new_sample.depth < sort_buffer[s].depth)
-			{
-				swap(new_sample, sort_buffer[s]);
-			}
+			const int coll_id = point_list[range.x + progress];
+			collected_id[tid] = coll_id;
+			collected_v1_view[tid] = s_v1_view[coll_id];
+			collected_v2_view[tid] = s_v2_view[coll_id];
+			collected_v3_view[tid] = s_v3_view[coll_id];
+			collected_normal_view[tid] = s_normal_view[coll_id];
 		}
-		++sort_num;
+		block.sync();
 
-		// Blend one sample if the buffer is full
-		if (sort_num == SORT_WINDOW_SIZE)
-			blend_one();
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			TriangleSample s;
+			if (!sampleTriangle(p_ray, collected_v1_view[j], collected_v2_view[j], collected_v3_view[j], collected_normal_view[j], gamma, ecc_max, s))
+				continue;
+			window.push(collected_id[j], s.depth);
+			if (window.size == SORT_WINDOW_SIZE)
+				blend_nearest();
+		}
 	}
 
-	// Blend remaining samples in the buffer
-	while (!done && sort_num > 0)
-		blend_one();
+	// Blend remaining samples in the window
+	while (!done && window.size > 0)
+		blend_nearest();
 
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
