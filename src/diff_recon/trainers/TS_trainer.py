@@ -2,6 +2,7 @@ import os
 import shutil
 import time
 import traceback
+from copy import copy
 
 import numpy as np
 import torch
@@ -19,6 +20,10 @@ from ..utils.camera import Camera
 from ..utils.vis_utils import save_image_tensor
 
 
+def _interval_due(iteration: int, interval: int | None) -> bool:
+    return interval is not None and interval > 0 and iteration % interval == 0
+
+
 class TSTrainer:
     """Coordinate 2DTS initialization, optimization, evaluation, and exports."""
 
@@ -26,6 +31,9 @@ class TSTrainer:
         time_str = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
         default_config = Config(trainer=Config(), dataset=Config(), model=Config())
         self.config = config if isinstance(config, Config) else loadConfig(config) if config is not None else default_config
+        for section in ("trainer", "dataset", "model"):
+            if getattr(self.config, section) is None:
+                setattr(self.config, section, Config())
         self.exp_name = time_str if not exp_name else exp_name
         self.device = device if isinstance(device, torch.device) else torch.device(f"cuda:{device}") if device is not None else torch.device("cuda")
 
@@ -38,6 +46,14 @@ class TSTrainer:
 
         self.output_dir = os.path.join(output_dir, self.exp_name)
         if clean_output_dir and log_file:
+            base_path = os.path.realpath(output_dir)
+            experiment_path = os.path.realpath(self.output_dir)
+            try:
+                contained = os.path.commonpath((base_path, experiment_path)) == base_path
+            except ValueError:
+                contained = False
+            if not contained or os.path.normcase(experiment_path) == os.path.normcase(base_path):
+                raise ValueError("Cleaning requires an experiment directory inside output_dir")
             shutil.rmtree(self.output_dir, ignore_errors=True)
 
         self.logger = Logger(time_str, os.path.join(self.output_dir, "log") if log_file else None, use_tensorboard=use_tensorboard)
@@ -55,6 +71,8 @@ class TSTrainer:
 
         # Initialize model
         train_size = self.dataset.getTrainDatasetSize()
+        if train_size <= 0:
+            raise ValueError("Training requires at least one training camera")
         pruning = getattr(self.config.model.model_update, "contribution_pruning", None)
         if pruning is not None and pruning.interval_iter == -1:
             assert pruning.start_iter % train_size == 0, "Auto pruning interval requires start_iter to align with train_size"
@@ -67,22 +85,25 @@ class TSTrainer:
         self.ssimLoss = ssimLoss.to(self.device)
         self.logger.info(f"SSIM loss backend: {'fused-ssim' if fused_ssim is not None else 'PyTorch'}")
         self.lpips = LPIPS(net_type="vgg", reduction="mean", normalize=True).to(self.device)
-        if self.config.trainer.w_dog > 0:
+        if (self.config.trainer.w_dog or 0) > 0:
             self.dogLoss = dogLoss.to(self.device)
         if self.config.trainer.smoothness_loss:
             self.smoothnessLoss = smoothnessLoss.to(self.device)
-        if self.config.trainer.geometry_loss and self.config.trainer.geometry_loss.w_geometry > 0:
+        if self.config.trainer.geometry_loss and (self.config.trainer.geometry_loss.w_geometry or 0) > 0:
             scale_factor = self.config.trainer.geometry_loss.scale_factor if self.config.trainer.geometry_loss.scale_factor is not None else 1.0
             depth_grad = self.config.trainer.geometry_loss.depth_grad if self.config.trainer.geometry_loss.depth_grad is not None else False
             self.depthNormalLoss = DepthNormalLoss(depth_grad=depth_grad, scale_factor=scale_factor)
-        if self.config.trainer.consistency_loss and (self.config.trainer.consistency_loss.w_geo > 0 or self.config.trainer.consistency_loss.w_color > 0):
-            error_thres = self.config.trainer.consistency_loss.error_thres
+        if self.config.trainer.consistency_loss and (
+            (self.config.trainer.consistency_loss.w_geo or 0) > 0 or (self.config.trainer.consistency_loss.w_color or 0) > 0
+        ):
+            error_thres = self.config.trainer.consistency_loss.error_thres if self.config.trainer.consistency_loss.error_thres is not None else 1.0
             n_sample = self.config.trainer.consistency_loss.n_sample
-            patch_size = self.config.trainer.consistency_loss.patch_size
-            dilation = self.config.trainer.consistency_loss.dilation
+            patch_size = self.config.trainer.consistency_loss.patch_size if self.config.trainer.consistency_loss.patch_size is not None else 3
+            dilation = self.config.trainer.consistency_loss.dilation if self.config.trainer.consistency_loss.dilation is not None else 1
             self.consistencyLoss = ConsistencyLoss(error_thres=error_thres, n_sample=n_sample, patch_size=patch_size, dilation=dilation)
         self._nearest_indices_cache = None
         self._nearest_vertex = None
+        self._accumulated_views = 0
 
         # For logging and profiling
         test_img_count = self.dataset.getTestDatasetSize()
@@ -113,8 +134,11 @@ class TSTrainer:
 
     def _get_loss(self, iteration: int, render_pkg: dict) -> None:
         def scheduled_weight(section, name):
-            if section is not None and iteration > section.start_iter:
-                return getattr(section, name)
+            if section is not None:
+                start_iter = section.start_iter if section.start_iter is not None else 0
+                if iteration > start_iter:
+                    value = getattr(section, name)
+                    return value if value is not None else 0
             return 0
 
         cam: Camera = render_pkg["camera"]
@@ -144,6 +168,10 @@ class TSTrainer:
         smoothness_scales = (
             config.smoothness_loss.scale_factor if (config.smoothness_loss is not None and config.smoothness_loss.scale_factor is not None) else [1.0]
         )
+        if isinstance(smoothness_scales, (int, float)):
+            smoothness_scales = [smoothness_scales]
+        if not smoothness_scales and (w_smoothness_image > 0 or w_smoothness_normal > 0 or w_smoothness_depth > 0):
+            raise ValueError("Smoothness losses require at least one scale factor")
 
         w_consistency_geo = scheduled_weight(config.consistency_loss, "w_geo")
         w_consistency_color = scheduled_weight(config.consistency_loss, "w_color")
@@ -154,6 +182,8 @@ class TSTrainer:
         w_vertex_reg = scheduled_weight(config.vertex_reg, "w_vertex_reg")
 
         # pixelwise losses
+        if gt_image is None and (w_L1 > 0 or w_L2 > 0 or w_ssim > 0 or w_dog > 0):
+            raise ValueError("Photometric losses require a ground truth image")
         if gt_mask is not None and config.train_alpha_mask:
             gt_image = gt_image * gt_mask
             image = image * gt_mask
@@ -163,7 +193,11 @@ class TSTrainer:
         ssim_loss = self.ssimLoss(image, gt_image) if w_ssim > 0 else 0
         dog_loss = self.dogLoss(image, gt_image) if w_dog > 0 else 0
         geometry_loss = self.depthNormalLoss(depth, normal, cam.tan_fovx, cam.tan_fovy, alpha_mask, gt_image) if w_geometry > 0 else 0
-        distortion_loss = distortion.mean() / self.dataset.cameras_extent if w_distortion > 0 else 0
+        distortion_loss = 0
+        if w_distortion > 0:
+            if self.dataset.cameras_extent is None or self.dataset.cameras_extent <= 0:
+                raise ValueError("Distortion loss requires a positive camera extent")
+            distortion_loss = distortion.mean() / self.dataset.cameras_extent
 
         image_smoothness_loss = (
             torch.stack([self.smoothnessLoss(image, gt_image, gt_mask, scale) for scale in smoothness_scales]).mean() if w_smoothness_image > 0 else 0
@@ -186,10 +220,10 @@ class TSTrainer:
             consistency_geo_loss, consistency_color_loss = 0, 0
 
         # regularization losses
-        scaling_reg = scaling.mean() if w_scaling_reg != 0 else 0
+        scaling_reg = (scaling.mean() if scaling.numel() else scaling.sum()) if w_scaling_reg != 0 else 0
 
         opacity_reg = 0
-        if w_opacity_reg > 0:
+        if w_opacity_reg != 0 and opacity.numel():
             if config.opacity_reg.type == "linear":
                 opacity_reg = (1 - opacity).mean()
             elif config.opacity_reg.type == "quad":
@@ -205,9 +239,12 @@ class TSTrainer:
             affine_reg = L1(image, image_original)
 
         vertex_reg = 0
-        if w_vertex_reg > 0:
+        if w_vertex_reg > 0 and vertex.shape[0] > 1:
+            interval = config.vertex_reg.interval_iter if config.vertex_reg.interval_iter is not None else 1
+            if interval <= 0:
+                raise ValueError("vertex_reg.interval_iter must be positive")
             if (
-                (iteration - 1) % config.vertex_reg.interval_iter == 0
+                (iteration - 1) % interval == 0
                 or self._nearest_indices_cache is None
                 or vertex is not self._nearest_vertex
             ):
@@ -231,25 +268,40 @@ class TSTrainer:
         )
         reg_loss = w_scaling_reg * scaling_reg + w_opacity_reg * opacity_reg + w_affine_reg * affine_reg + w_vertex_reg * vertex_reg
         loss = img_loss + reg_loss
+        if not torch.is_tensor(loss) or not loss.requires_grad:
+            # A disabled/fully filtered objective still permits a normal zero
+            # backward through the renderer and records zero densification data.
+            loss = loss + image.sum() * 0
 
         render_pkg["loss"] = loss
         render_pkg["geometry_loss"] = geometry_loss
         render_pkg["distortion_loss"] = distortion_loss
         render_pkg["vertex_loss"] = vertex_reg
 
-    def _optimize(self, iteration: int, render_pkg: dict):
+    def _optimize(self, iteration: int, render_pkg: dict, force_step: bool = False):
         bs = self.config.trainer.batch_size if self.config.trainer.batch_size is not None else 1
+        if not isinstance(bs, (int, np.integer)) or bs <= 0:
+            raise ValueError("batch_size must be a positive integer")
 
         # Backpropagate every view so its graph is freed and its densification gradient is recorded;
         # parameter gradients accumulate (sum) until the batch of views is complete.
         render_pkg["loss"].backward()
         render_pkg["grad"] = render_pkg["grad_holder"].grad
-        if iteration % bs != 0:
-            return
+        self._accumulated_views = getattr(self, "_accumulated_views", 0) + 1
+        if self._accumulated_views < bs and not force_step:
+            return False
 
         self.model.update_learning_rate(iteration)
         self.model.optimizer.step()
         self.model.optimizer.zero_grad(set_to_none=True)
+        self._accumulated_views = 0
+        return True
+
+    def _checkpoint_due(self, iteration: int) -> bool:
+        config = self.config.trainer
+        return (config.checkpoint_iterations is not None and iteration in config.checkpoint_iterations) or _interval_due(
+            iteration, config.ckpt_interval_iter
+        )
 
     def _log_stats(self, log_pkg: dict):
         iteration = log_pkg["iteration"]
@@ -290,8 +342,10 @@ class TSTrainer:
         opacity = opacity[torch.randperm(opacity.shape[0])[:sample_num]]
         scaling = scaling[torch.randperm(scaling.shape[0])[:sample_num]]
 
-        self.logger.add_histogram("Opacity Histogram", opacity, iteration)
-        self.logger.add_histogram("Scaling Histogram", scaling, iteration)
+        if opacity.numel():
+            self.logger.add_histogram("Opacity Histogram", opacity, iteration)
+        if scaling.numel():
+            self.logger.add_histogram("Scaling Histogram", scaling, iteration)
 
     @torch.no_grad()
     def _evaluate(self, iteration: int, use_tensorboard: bool = True, save_img: bool = False) -> float:
@@ -347,6 +401,8 @@ class TSTrainer:
     def _train(self):
         dataset: BaseDatasetFactory = self.dataset
         config = self.config.trainer
+        if config.iterations is None or not isinstance(config.iterations, (int, np.integer)) or config.iterations < 0:
+            raise ValueError("trainer.iterations must be a nonnegative integer")
 
         # Initialize model
         first_iter = 0
@@ -365,6 +421,10 @@ class TSTrainer:
             self.logger.info("Initializing Triangles from point cloud")
             self.model.create_from_pcd(dataset.getPointCloud())
         self.model.state_update(first_iter)
+        if self.model.optimizer is None:
+            raise ValueError("Training requires a configured model optimizer")
+        self.model.optimizer.zero_grad(set_to_none=True)
+        self._accumulated_views = 0
 
         if config.initial_eval:
             self._evaluate(first_iter, save_img=config.save_eval_img)
@@ -385,9 +445,13 @@ class TSTrainer:
             self._get_loss(iteration, render_pkg)
 
             timer.log("optimizer step")
-            self._optimize(iteration, render_pkg)
+            # Batch size is a maximum number of accumulated views. Flush before
+            # topology/value mutations, checkpoints (gradients are not serialized),
+            # and the last view so no pending gradients are lost.
+            force_step = iteration == config.iterations or self._checkpoint_due(iteration) or self.model.has_parameter_update(iteration)
+            self._optimize(iteration, render_pkg, force_step=force_step)
 
-            if config.log_interval_iter > 0 and iteration % config.log_interval_iter == 0:
+            if _interval_due(iteration, config.log_interval_iter):
                 timer.log("logging")
                 log_pkg = {
                     **render_pkg,
@@ -401,11 +465,11 @@ class TSTrainer:
                 }
                 self._log_stats(log_pkg)
 
-            if config.histogram_interval_iter > 0 and iteration % config.histogram_interval_iter == 0:
+            if _interval_due(iteration, config.histogram_interval_iter):
                 timer.log("histogram")
                 self._histogram(iteration, render_pkg)
 
-            if config.eval_interval_iter > 0 and iteration % config.eval_interval_iter == 0:
+            if _interval_due(iteration, config.eval_interval_iter):
                 timer.log("evaluation")
                 self._evaluate(iteration, save_img=config.save_eval_img)
 
@@ -417,14 +481,12 @@ class TSTrainer:
                 save_image_tensor(render_pkg["densification_img"], f"{self.output_dir}/train/{iteration:>05d}_densification.png")
 
             if (config.save_iterations is not None and iteration in config.save_iterations) or (
-                config.save_interval_iter > 0 and iteration % config.save_interval_iter == 0
+                _interval_due(iteration, config.save_interval_iter)
             ):
                 timer.log("point cloud saving")
                 self.model.savePLY(f"{self.output_dir}/point_cloud/{iteration}.ply")
 
-            if (config.checkpoint_iterations is not None and iteration in config.checkpoint_iterations) or (
-                config.ckpt_interval_iter > 0 and iteration % config.ckpt_interval_iter == 0
-            ):
+            if self._checkpoint_due(iteration):
                 timer.log("checkpoint saving")
                 self.model.save_ckpt(f"{self.output_dir}/ckpt/{iteration}.ckpt")
 
@@ -441,7 +503,7 @@ class TSTrainer:
                 self._save_pcd(f"{self.output_dir}/mesh_ply/{iteration}_pcd.ply", rescale_ratio, n_sample, grid_size)
 
             timer.stop()
-            if config.log_interval_iter > 0 and iteration % config.log_interval_iter == 0:
+            if _interval_due(iteration, config.log_interval_iter):
                 self.logger.debug(timer.message())
 
         self.logger.info(timer.message())
@@ -462,14 +524,16 @@ class TSTrainer:
 
     @torch.no_grad()
     def _save_pcd(self, ply_path: str, rescale_ratio: float = 1.0, n_sample: int = 5_000_000, grid_size: float = None):
+        if not np.isfinite(rescale_ratio) or rescale_ratio <= 0:
+            raise ValueError("rescale_ratio must be finite and greater than zero")
         self.logger.info("Rendering point cloud from training views")
 
         view_pcds = []
         pbar = tqdm(range(self.dataset.getTrainDatasetSize()))
         for i in pbar:
-            camera = self.dataset.getTrainData(i).to(self.device)
-            camera.image_width = int(camera.image_width * rescale_ratio)
-            camera.image_height = int(camera.image_height * rescale_ratio)
+            camera = copy(self.dataset.getTrainData(i)).to(self.device)
+            camera.image_width = max(1, int(camera.image_width * rescale_ratio))
+            camera.image_height = max(1, int(camera.image_height * rescale_ratio))
             cur_pcd = self.model.render_points(camera)
             view_pcds.append(cur_pcd)
             pbar.set_postfix_str(f"N points: {len(cur_pcd)}")

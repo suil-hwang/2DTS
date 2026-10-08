@@ -3,17 +3,52 @@ from pathlib import Path
 from scipy.spatial.transform import Rotation
 from scipy.spatial.distance import cdist
 
-from .colmap_loader import CameraInfo
+from .colmap_loader import CameraInfo, readColmapCameras, read_intrinsics_binary, read_intrinsics_text
 from ..utils.camera import rotmat2qvec
 from ..models.point_cloud import PointCloud
 
 
+def read_validated_colmap_cameras(images_path: str, cameras_path: str, images_folder: str) -> list[CameraInfo]:
+    """Keep legacy parsing, then validate calibration before cameras reach the renderer."""
+    cam_infos = readColmapCameras(images_path, cameras_path, images_folder)
+    intrinsics = read_intrinsics_binary(cameras_path) if cameras_path.endswith(".bin") else read_intrinsics_text(cameras_path)
+    for camera_id in {cam.camera_id for cam in cam_infos}:
+        intr = intrinsics[camera_id]
+        if intr.width <= 0 or intr.height <= 0 or not np.isfinite(intr.params).all():
+            raise ValueError(f"Camera {intr.id} requires positive image dimensions and finite intrinsics")
+        if intr.model == "PINHOLE":
+            if len(intr.params) != 4:
+                raise ValueError(f"Camera {intr.id} PINHOLE requires four parameters")
+            fx, fy, cx, cy = intr.params
+        elif intr.model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL"):
+            expected = 4 if intr.model == "SIMPLE_RADIAL" else 3
+            if len(intr.params) != expected:
+                raise ValueError(f"Camera {intr.id} {intr.model} requires {expected} parameters")
+            fx, cx, cy = intr.params[:3]
+            fy = fx
+            if intr.model == "SIMPLE_RADIAL" and abs(intr.params[3]) > 1e-12:
+                raise ValueError(f"Camera {intr.id} must be undistorted; run COLMAP image_undistorter before loading")
+        else:
+            raise ValueError(f"Camera model {intr.model} is unsupported; only centered, undistorted pinhole cameras are supported")
+        if fx <= 0 or fy <= 0:
+            raise ValueError(f"Camera {intr.id} requires positive focal lengths")
+        # Preserve the existing half-pixel convention tolerance; offsets are not corrected.
+        if abs(cx - intr.width / 2) > 0.5 or abs(cy - intr.height / 2) > 0.5:
+            raise ValueError(f"Camera {intr.id} principal point must be centered within 0.5 pixels; only centered, undistorted cameras are supported")
+    return [cam._replace(image_name=Path(cam.image_path).stem) for cam in cam_infos]
+
+
 def getCameraExtent(cam_infos: list[CameraInfo]) -> float:
+    if not cam_infos:
+        raise ValueError("At least one camera is required to estimate the scene extent")
     cam_centers = [-cam.R @ cam.T for cam in cam_infos]
     cam_centers = np.stack(cam_centers, axis=0)
+    if not np.isfinite(cam_centers).all():
+        raise ValueError("Camera centers must be finite")
     center = cam_centers.mean(axis=0, keepdims=True)
     extent = np.linalg.norm(cam_centers - center, axis=1).max() * 1.1
-    return extent
+    # Coincident centers provide no scene scale; use a unit scale instead of a zero near plane/loss divisor.
+    return extent if extent > 0 else 1.0
 
 
 def camInfosToColmap(cam_infos: list[CameraInfo], save_dir: str) -> None:
@@ -21,21 +56,21 @@ def camInfosToColmap(cam_infos: list[CameraInfo], save_dir: str) -> None:
 
     cam_dict = {}
     quats = rotmat2qvec(np.array([cam.R.T for cam in cam_infos]).reshape(-1, 3, 3))  # world-to-camera, as COLMAP stores it
+    for cam in cam_infos:
+        width, height = cam.width, cam.height
+        fx = 0.5 * width / np.tan(0.5 * cam.FovX)
+        fy = 0.5 * height / np.tan(0.5 * cam.FovY)
+        intrinsics = (width, height, fx, fy)
+        if cam.camera_id in cam_dict and cam_dict[cam.camera_id] != intrinsics:
+            raise ValueError(f"Camera ID {cam.camera_id} has inconsistent parameters: {cam_dict[cam.camera_id]} vs {intrinsics}")
+        cam_dict[cam.camera_id] = intrinsics
     with open(f"{save_dir}/images.txt", "w", encoding="utf-8") as f_images:
         for i, (cam, quat) in enumerate(zip(cam_infos, quats)):
-            width, height = cam.width, cam.height
-            f = 0.5 * height / np.tan(0.5 * cam.FovY)
-            if cam.camera_id in cam_dict:
-                if cam_dict[cam.camera_id] != (width, height, f):
-                    raise ValueError(f"Camera ID {cam.camera_id} has inconsistent parameters: {cam_dict[cam.camera_id]} vs ({width}, {height}, {f})")
-            else:
-                cam_dict[cam.camera_id] = (width, height, f)
-
             f_images.write(f"{i} {quat[0]} {quat[1]} {quat[2]} {quat[3]} {cam.T[0]} {cam.T[1]} {cam.T[2]} {cam.camera_id} {cam.image_name}\n\n")
 
     with open(f"{save_dir}/cameras.txt", "w", encoding="utf-8") as f_cameras:
-        for cam_id, (width, height, f) in cam_dict.items():
-            f_cameras.write(f"{cam_id} PINHOLE {width} {height} {f} {f} {width / 2} {height / 2}\n")
+        for cam_id, (width, height, fx, fy) in cam_dict.items():
+            f_cameras.write(f"{cam_id} PINHOLE {width} {height} {fx} {fy} {width / 2} {height / 2}\n")
 
 
 def pointCloudToColmap(pcd: PointCloud, save_dir: str) -> None:
@@ -105,6 +140,12 @@ def interpolateCameraInfos(
     Returns:
         List of interpolated camera information
     """
+    if not isinstance(num_interp, (int, np.integer)) or isinstance(num_interp, bool) or num_interp < 0:
+        raise ValueError("num_interp must be a nonnegative integer")
+    if num_interp == 0 or not target_cam_infos:
+        return []
+    if not source_cam_infos:
+        raise ValueError("At least one source camera is required for interpolation")
     # Extract camera positions and rotations
     s_positions = np.array([-cam.R @ cam.T for cam in source_cam_infos])  # Camera centers in world coordinates
     t_positions = np.array([-cam.R @ cam.T for cam in target_cam_infos])
@@ -116,6 +157,8 @@ def interpolateCameraInfos(
     if ground_z is not None:
         s_lookat = s_Rs[:, :, 2]
         t_lookat = t_Rs[:, :, 2]
+        if not np.isfinite(ground_z) or np.any(np.abs(s_lookat[:, 2]) <= 1e-12) or np.any(np.abs(t_lookat[:, 2]) <= 1e-12):
+            raise ValueError("Camera viewing directions must intersect the finite ground plane")
         s_lookat_pos = s_positions + s_lookat * (ground_z - s_positions[:, 2:3]) / s_lookat[:, 2:3]
         t_lookat_pos = t_positions + t_lookat * (ground_z - t_positions[:, 2:3]) / t_lookat[:, 2:3]
         position_dist = cdist(t_lookat_pos, s_lookat_pos)

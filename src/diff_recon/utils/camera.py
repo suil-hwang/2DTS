@@ -5,6 +5,8 @@ from scipy.spatial.transform import Rotation
 
 
 def getWorld2ViewMatrix(R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    if np.shape(R) != (3, 3) or np.shape(t) != (3,) or not np.isfinite(R).all() or not np.isfinite(t).all():
+        raise ValueError("Camera pose requires a finite (3, 3) rotation and (3,) translation")
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = R.transpose()
     Rt[:3, 3] = t
@@ -14,6 +16,10 @@ def getWorld2ViewMatrix(R: np.ndarray, t: np.ndarray) -> np.ndarray:
 
 
 def getProjectionMatrix(znear, zfar, fovX, fovY) -> torch.Tensor:
+    if not (math.isfinite(znear) and math.isfinite(zfar) and 0 < znear < zfar):
+        raise ValueError("Projection requires finite 0 < znear < zfar")
+    if not all(math.isfinite(fov) and 0 < fov < math.pi for fov in (fovX, fovY)):
+        raise ValueError("Camera FoVs must be finite and between 0 and pi")
     tanHalfFovY = math.tan((fovY / 2))
     tanHalfFovX = math.tan((fovX / 2))
 
@@ -22,7 +28,7 @@ def getProjectionMatrix(znear, zfar, fovX, fovY) -> torch.Tensor:
     right = tanHalfFovX * znear
     left = -right
 
-    P = torch.zeros(4, 4)
+    P = torch.zeros(4, 4, dtype=torch.float32)
 
     z_sign = 1.0
 
@@ -80,9 +86,13 @@ class Camera(torch.nn.Module):
 
         # clamp returns a new tensor, so the source array is never aliased
         self.gt_image = torch.as_tensor(gt_image).float().clamp(0.0, 1.0) if gt_image is not None else None
+        if self.gt_image is not None and (self.gt_image.ndim != 3 or min(self.gt_image.shape) <= 0):
+            raise ValueError("gt_image must have nonempty (channels, height, width) dimensions")
         self.alpha_mask = torch.tensor(gt_alpha_mask).float() if gt_alpha_mask is not None else None
         self.image_width = image_width if image_width is not None else self.gt_image.shape[2]
         self.image_height = image_height if image_height is not None else self.gt_image.shape[1]
+        if not isinstance(self.image_width, (int, np.integer)) or not isinstance(self.image_height, (int, np.integer)) or self.image_width <= 0 or self.image_height <= 0:
+            raise ValueError("Camera image dimensions must be positive integers")
         self.image_size = (self.image_width, self.image_height)
         if self.FoVy is None:
             self.FoVy = math.atan(math.tan(self.FoVx / 2) * (self.image_height / self.image_width)) * 2

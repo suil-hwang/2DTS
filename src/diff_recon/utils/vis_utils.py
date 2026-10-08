@@ -6,7 +6,7 @@ import torch
 import cv2
 from pathlib import Path
 
-from simple_knn import distCUDA2
+from scipy.spatial import KDTree
 
 
 def plot_camera(proj_polygon: Polygon, tile_polygon: Polygon, cam_center: np.ndarray = None, name: str = "cam_polygon") -> None:
@@ -17,7 +17,7 @@ def plot_camera(proj_polygon: Polygon, tile_polygon: Polygon, cam_center: np.nda
 
     proj_x, proj_y = -np.array(proj_x), -np.array(proj_y)
     tile_x, tile_y = -np.array(tile_x), -np.array(tile_y)
-    cam_center = -cam_center
+    cam_center = -cam_center if cam_center is not None else None
 
     plt.plot(proj_x, proj_y, label="Camera", color="orange")
     plt.plot(tile_x, tile_y, label="Tile", color="blue")
@@ -31,7 +31,9 @@ def plot_camera(proj_polygon: Polygon, tile_polygon: Polygon, cam_center: np.nda
     plt.gca().set_aspect("equal", adjustable="box")
     plt.legend()
     plt.title(name)
+    Path("outputs").mkdir(exist_ok=True)
     plt.savefig(f"outputs/{name}.png")
+    plt.close(fig)
 
 
 def camera_to_mesh(
@@ -63,7 +65,13 @@ def camera_to_mesh(
 
     c2ws = np.linalg.inv(w2cs)
     centers = c2ws[:, :3, 3]
-    mean_distance = distCUDA2(torch.tensor(centers).float().cuda()).clamp_(min=1e-10).sqrt().mean().cpu().numpy()
+    if len(centers) == 0:
+        raise ValueError("At least one camera is required")
+    if len(centers) == 1:
+        mean_distance = 1e-5
+    else:
+        distances, _ = KDTree(centers).query(centers, k=min(4, len(centers)), workers=-1)
+        mean_distance = np.sqrt(np.maximum(np.mean(distances[:, 1:] ** 2, axis=1), 1e-10)).mean()
     print(f"Mean distance between camera centers: {mean_distance:.3f} m")
     cam_size = mean_distance * 0.2
 
@@ -121,7 +129,8 @@ def save_image_tensor(image: torch.Tensor | np.ndarray, path: str) -> None:
         image = image[:, :, 0].astype(np.uint8)
     else:
         image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR).astype(np.uint8)
-    cv2.imwrite(path, image)
+    if not cv2.imwrite(str(path), image):
+        raise OSError(f"Failed to save image: {path}")
     print(f"Image saved to {path}, shape: {image.shape}")
 
 

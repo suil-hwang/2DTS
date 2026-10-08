@@ -25,7 +25,6 @@ namespace Params
 			if (resize){
 				size_t required_size = requiredSize(data_size);
 				t.resize_({(long long) required_size});
-				t.fill_(0);
 			}
             char *chunk = reinterpret_cast<char *>(t.contiguous().data_ptr());
 			fromChunk(chunk, data_size);
@@ -64,7 +63,6 @@ namespace Params
 			if (resize){
 				size_t required_size = requiredSize(data_size, use_vertex_color);
 				t.resize_({(long long) required_size});
-				t.fill_(0);
 			}
             char *chunk = reinterpret_cast<char *>(t.contiguous().data_ptr());
 			fromChunk(chunk, data_size, use_vertex_color);
@@ -104,14 +102,16 @@ namespace Params
 		uint2* ranges;
 		uint32_t* n_contribs;
 		float* final_Ts;
-		float2* distortion_moments;
+		float2* distortion_moments; // Foreground contribution weight and weighted mean depth.
+		const size_t tile_count;
 
-        ImageState(torch::Tensor t, size_t data_size, bool resize = false) {
+        ImageState(torch::Tensor t, size_t data_size, size_t tile_count, bool resize = false)
+			: tile_count(tile_count) {
 			fromTensor(t, data_size, resize);
 		}
 
 		void fromChunk(char*& chunk, size_t N) override {
-			obtain(chunk, ranges, N, 128);
+			obtain(chunk, ranges, tile_count, 128);
 			obtain(chunk, n_contribs, N, 128);
 			obtain(chunk, final_Ts, N, 128);
 			obtain(chunk, distortion_moments, N, 128);

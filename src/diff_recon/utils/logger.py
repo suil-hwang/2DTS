@@ -22,6 +22,7 @@ class LogRecord(NamedTuple):
     tag: str
     value: Union[float, torch.Tensor, logging.LogRecord]
     global_step: int
+    bins: Union[str, int] = "auto"
 
 
 class ColoredFormatter(logging.Formatter):
@@ -46,23 +47,28 @@ class ColoredFormatter(logging.Formatter):
         return formatter.format(record)
 
 
-def getLogger(name, log_file_dir: Optional[str] = None, stream: Optional[TextIO] = None, level=logging.DEBUG) -> logging.Logger:
-    logger = logging.getLogger(name)
+def getLogger(name, log_file_dir: Optional[str] = None, stream: Optional[TextIO] = None, level=logging.DEBUG, isolated: bool = False) -> logging.Logger:
+    logger = logging.Logger(name) if isolated else logging.getLogger(name)
     logger.setLevel(level)
     file_formatter = logging.Formatter("%(asctime)s - %(levelname)s: %(message)s")
     stream_formatter = ColoredFormatter()
 
     if log_file_dir is not None:
-        fileinfo = logging.FileHandler(os.path.join(log_file_dir, f"{name}_outputs.log"))
-        fileinfo.setLevel(logging.INFO)
-        fileinfo.setFormatter(file_formatter)
-        logger.addHandler(fileinfo)
+        file_path = os.path.abspath(os.path.join(log_file_dir, f"{name}_outputs.log"))
+        if not any(isinstance(handler, logging.FileHandler) and handler.baseFilename == file_path
+                   for handler in logger.handlers):
+            fileinfo = logging.FileHandler(file_path, encoding="utf-8")
+            fileinfo.setLevel(logging.INFO)
+            fileinfo.setFormatter(file_formatter)
+            logger.addHandler(fileinfo)
 
     if stream is not None:
-        controlshow = logging.StreamHandler(stream)
-        controlshow.setLevel(logging.DEBUG)
-        controlshow.setFormatter(stream_formatter)
-        logger.addHandler(controlshow)
+        if not any(isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
+                   and handler.stream is stream for handler in logger.handlers):
+            controlshow = logging.StreamHandler(stream)
+            controlshow.setLevel(logging.DEBUG)
+            controlshow.setFormatter(stream_formatter)
+            logger.addHandler(controlshow)
 
     return logger
 
@@ -77,11 +83,21 @@ class Logger_MP:
         self.use_tensorboard = use_tensorboard
 
         self.log_queue = Queue(-1)
-        self.listener = Process(target=self._listener_process, args=(self.log_queue, log_file_dir, stream, use_tensorboard))
+        if stream is sys.stdout:
+            stream = "__stdout__"
+        elif stream is sys.stderr:
+            stream = "__stderr__"
+        self.listener = Process(target=Logger_MP._listener_process,
+                                args=(name, self.log_queue, log_file_dir, stream, use_tensorboard))
         self.listener.start()
 
-    def _listener_process(self, log_queue: Queue, log_file_dir: str, stream: TextIO, use_tensorboard: bool):
-        logger = getLogger(self.name, log_file_dir, stream)
+    @staticmethod
+    def _listener_process(name, log_queue: Queue, log_file_dir: str, stream: TextIO, use_tensorboard: bool):
+        if stream == "__stdout__":
+            stream = sys.stdout
+        elif stream == "__stderr__":
+            stream = sys.stderr
+        logger = getLogger(name, log_file_dir, stream, isolated=True)
         tb_writter = SummaryWriter(log_file_dir) if use_tensorboard and log_file_dir is not None else None
 
         while True:
@@ -100,7 +116,7 @@ class Logger_MP:
                         tb_writter.add_image(record.tag, record.value, record.global_step)
                 elif record.type == LogType.TB_HISTOGRAM:
                     if tb_writter is not None:
-                        tb_writter.add_histogram(record.tag, record.value, record.global_step)
+                        tb_writter.add_histogram(record.tag, record.value, record.global_step, bins=record.bins)
             except Exception:
                 logger.error("Whoops! Problem:")
                 traceback.print_exc(file=sys.stderr)
@@ -113,17 +129,23 @@ class Logger_MP:
 
     def add_scalar(self, tag: str, scalar_value: float, global_step: int):
         if self.use_tensorboard:
+            if isinstance(scalar_value, torch.Tensor):
+                scalar_value = scalar_value.detach().cpu()
             log_record = LogRecord(LogType.TB_SCALAR, tag, scalar_value, global_step)
             self.log_queue.put(log_record)
 
     def add_image(self, tag: str, img_tensor, global_step: int):
         if self.use_tensorboard:
+            if isinstance(img_tensor, torch.Tensor):
+                img_tensor = img_tensor.detach().cpu()
             log_record = LogRecord(LogType.TB_IMAGE, tag, img_tensor, global_step)
             self.log_queue.put(log_record)
 
     def add_histogram(self, tag: str, values, global_step: int, bins="auto"):
         if self.use_tensorboard:
-            log_record = LogRecord(LogType.TB_HISTOGRAM, tag, values, global_step)
+            if isinstance(values, torch.Tensor):
+                values = values.detach().cpu()
+            log_record = LogRecord(LogType.TB_HISTOGRAM, tag, values, global_step, bins)
             self.log_queue.put(log_record)
 
     def log(self, level, msg, *args, **kwargs):
@@ -154,8 +176,11 @@ class Logger_MP:
             self.warned_msg.add(message)
 
     def __del__(self):
-        self.log_queue.put(None)
-        self.listener.join()
+        listener = getattr(self, "listener", None)
+        if listener is not None and listener.pid is not None:
+            if listener.is_alive():
+                self.log_queue.put(None)
+            listener.join()
 
 
 class Logger:
@@ -165,7 +190,8 @@ class Logger:
             Path(log_file_dir).mkdir(parents=True, exist_ok=True)
 
         self.name = name
-        self.logger = getLogger(name, log_file_dir, stream)
+        # Each wrapper owns its handlers; same-second experiments must not share sinks.
+        self.logger = getLogger(name, log_file_dir, stream, isolated=True)
         self.tb_writer = SummaryWriter(log_file_dir) if use_tensorboard and log_file_dir is not None else None
 
     def add_scalar(self, tag: str, scalar_value: float, global_step: int):
@@ -206,9 +232,11 @@ class Logger:
             self.warned_msg.add(message)
 
     def __del__(self):
-        if self.tb_writer is not None:
-            self.tb_writer.close()
-        for handler in self.logger.handlers:
+        writer = getattr(self, "tb_writer", None)
+        if writer is not None:
+            writer.close()
+        logger = getattr(self, "logger", None)
+        for handler in logger.handlers if logger is not None else ():
             try:
                 handler.close()
             except Exception as e:

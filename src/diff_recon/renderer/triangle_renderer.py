@@ -10,7 +10,7 @@ class TriangleRenderer:
         self,
         cam: Camera,
         bg_depth: float = 0.0,
-        bg_color: torch.Tensor = torch.Tensor([0, 0, 0]),
+        bg_color: torch.Tensor = None,
         sh_degree: int = 0,
         gamma: float = 1.0,
         back_culling: bool = False,
@@ -18,6 +18,8 @@ class TriangleRenderer:
         sort_level: int = 0,
         debug: bool = False,
     ):
+        if bg_color is None:
+            bg_color = torch.zeros(3, dtype=torch.float32, device=cam.device)
         raster_settings = TriangleRasterizationSettings(
             image_height=int(cam.image_height),
             image_width=int(cam.image_width),
@@ -46,6 +48,12 @@ class TriangleRenderer:
         color: torch.Tensor,
         opacity: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        """Render triangles; training backward requires ``rich_info=True``.
+
+        Native backward supports image, depth, normal, and distortion adjoints.
+        Alpha and contribution outputs are masks/statistics; their adjoints are
+        not implemented by the extension and must not be used as training losses.
+        """
         # Collect per-triangle densification statistics through the custom backward pass.
         grad_holder = torch.zeros((vertex.shape[0]), device=vertex.device, dtype=vertex.dtype, requires_grad=True)
 

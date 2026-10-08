@@ -16,7 +16,7 @@ class BaseDatasetFactory(abc.ABC):
         self._config = config if config is not None else Config()
         self._logger = logger if logger is not None else stdout_logger
 
-        self._num_workers = config.num_workers if config.num_workers is not None else 1
+        self._num_workers = self._config.num_workers if self._config.num_workers is not None else 1
         self._pin_memory = True
 
         self._train_dataset: Dataset = None
@@ -56,6 +56,8 @@ class BaseDatasetFactory(abc.ABC):
         return self._train_dataset[idx]
 
     def nextTrainData(self) -> Camera:
+        if self.getTrainDatasetSize() == 0:
+            raise ValueError("Training set is empty")
         if not hasattr(self, "_train_dataloader"):
             self._train_dataloader = self.getTrainDataset()
 

@@ -39,18 +39,30 @@ MATRIX_DIMS = {
 
 def load_glb_chunks(path: Path) -> tuple[dict, bytes]:
     with path.open("rb") as handle:
-        magic, version, length = struct.unpack("<III", handle.read(12))
+        header = handle.read(12)
+        if len(header) != 12:
+            raise ValueError(f"{path} has a truncated GLB header")
+        magic, version, length = struct.unpack("<III", header)
         if magic != 0x46546C67:
             raise ValueError(f"{path} is not a GLB file")
         if version != 2:
             raise ValueError(f"Unsupported GLB version: {version}")
+        if length != path.stat().st_size:
+            raise ValueError(f"{path} GLB length does not match its file size")
 
         json_chunk = None
         bin_chunk = b""
         while handle.tell() < length:
-            chunk_len, chunk_type = struct.unpack("<II", handle.read(8))
+            chunk_header = handle.read(8)
+            if len(chunk_header) != 8:
+                raise ValueError(f"{path} has a truncated GLB chunk header")
+            chunk_len, chunk_type = struct.unpack("<II", chunk_header)
+            if chunk_len % 4 or handle.tell() + chunk_len > length:
+                raise ValueError(f"{path} has an invalid GLB chunk length")
             chunk_data = handle.read(chunk_len)
             if chunk_type == JSON_CHUNK_TYPE:
+                if json_chunk is not None:
+                    raise ValueError(f"{path} contains multiple GLB JSON chunks")
                 json_chunk = json.loads(chunk_data.decode("utf-8").rstrip(" \t\r\n\x00"))
             elif chunk_type == BIN_CHUNK_TYPE:
                 bin_chunk = chunk_data
@@ -87,23 +99,49 @@ def _reshape_accessor_values(accessor_type: str, values: np.ndarray) -> np.ndarr
     return values.reshape(-1, dim, dim).transpose(0, 2, 1)
 
 
+def _read_accessor_buffer(data: bytes, dtype: np.dtype, count: int, accessor_type: str,
+                          offset: int, stride_bytes: int | None = None) -> np.ndarray:
+    components = TYPE_COMPONENTS[accessor_type]
+    if count == 0:
+        return np.empty((0, components), dtype=dtype)
+    if accessor_type in MATRIX_DIMS:
+        dim = MATRIX_DIMS[accessor_type]
+        column_stride = (dim * dtype.itemsize + 3) // 4 * 4
+        matrix_stride = dim * column_stride
+        values = np.ndarray((count, dim, dim), dtype=dtype, buffer=data, offset=offset,
+                            strides=(stride_bytes or matrix_stride, column_stride, dtype.itemsize))
+        return values.copy().reshape(count, components)
+    tight_stride = dtype.itemsize * components
+    if stride_bytes is None or stride_bytes == tight_stride:
+        return np.frombuffer(data, dtype=dtype, count=count * components, offset=offset).reshape(count, components)
+    return _read_strided_buffer(data, dtype, count, components, offset, stride_bytes)
+
+
+def _buffer_view_data(gltf: dict, bin_chunk: bytes, index: int) -> memoryview:
+    view = gltf["bufferViews"][index]
+    if view.get("buffer", 0) != 0:
+        raise ValueError("Only the GLB binary buffer is supported")
+    offset = view.get("byteOffset", 0)
+    end = offset + view.get("byteLength", len(bin_chunk) - offset)
+    if offset < 0 or end < offset or end > len(bin_chunk):
+        raise ValueError("Buffer view exceeds the GLB binary buffer")
+    return memoryview(bin_chunk)[offset:end]
+
+
 def read_accessor(gltf: dict, bin_chunk: bytes, accessor_index: int) -> np.ndarray:
     accessor = gltf["accessors"][accessor_index]
     component_type = accessor["componentType"]
-    dtype = np.dtype(COMPONENT_DTYPE[component_type])
+    dtype = np.dtype(COMPONENT_DTYPE[component_type]).newbyteorder("<")
     accessor_type = accessor["type"]
     num_components = TYPE_COMPONENTS[accessor_type]
     count = accessor["count"]
 
     if "bufferView" in accessor:
         buffer_view = gltf["bufferViews"][accessor["bufferView"]]
-        offset = buffer_view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
+        offset = accessor.get("byteOffset", 0)
         stride_bytes = buffer_view.get("byteStride")
-        tight_stride = dtype.itemsize * num_components
-        if stride_bytes is None or stride_bytes == tight_stride:
-            values = np.frombuffer(bin_chunk, dtype=dtype, count=count * num_components, offset=offset).reshape(count, num_components)
-        else:
-            values = _read_strided_buffer(bin_chunk, dtype, count, num_components, offset, stride_bytes)
+        values = _read_accessor_buffer(_buffer_view_data(gltf, bin_chunk, accessor["bufferView"]),
+                                      dtype, count, accessor_type, offset, stride_bytes)
     else:
         values = np.zeros((count, num_components), dtype=dtype)
 
@@ -112,15 +150,15 @@ def read_accessor(gltf: dict, bin_chunk: bytes, accessor_index: int) -> np.ndarr
         sparse_count = sparse["count"]
 
         indices_info = sparse["indices"]
-        indices_view = gltf["bufferViews"][indices_info["bufferView"]]
-        indices_offset = indices_view.get("byteOffset", 0) + indices_info.get("byteOffset", 0)
-        indices_dtype = np.dtype(COMPONENT_DTYPE[indices_info["componentType"]])
-        indices = np.frombuffer(bin_chunk, dtype=indices_dtype, count=sparse_count, offset=indices_offset)
+        indices_offset = indices_info.get("byteOffset", 0)
+        indices_dtype = np.dtype(COMPONENT_DTYPE[indices_info["componentType"]]).newbyteorder("<")
+        indices = np.frombuffer(_buffer_view_data(gltf, bin_chunk, indices_info["bufferView"]),
+                                dtype=indices_dtype, count=sparse_count, offset=indices_offset)
 
         values_info = sparse["values"]
-        values_view = gltf["bufferViews"][values_info["bufferView"]]
-        values_offset = values_view.get("byteOffset", 0) + values_info.get("byteOffset", 0)
-        sparse_values = np.frombuffer(bin_chunk, dtype=dtype, count=sparse_count * num_components, offset=values_offset).reshape(sparse_count, num_components)
+        values_offset = values_info.get("byteOffset", 0)
+        sparse_values = _read_accessor_buffer(_buffer_view_data(gltf, bin_chunk, values_info["bufferView"]),
+                                             dtype, sparse_count, accessor_type, values_offset)
 
         values = values.copy()
         values[indices] = sparse_values

@@ -238,7 +238,6 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	float3 dL_dnormal_pixel = {0, 0, 0};
 	float dL_ddepth_pixel = 0;
 	float dL_ddistortion_pixel = 0;
-	float depth_moment = 0;
 	float mean_depth = 0;
 	float distortion_per_weight = 0;
 
@@ -256,10 +255,9 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			dL_ddistortion_pixel = dL_dout_distortion[pix_id];
 			const float2 moments = distortion_moments[pix_id];
 			final_weight = moments.x;
-			depth_moment = moments.y;
+			mean_depth = moments.y;
 			if (final_weight > 0.0f)
 			{
-				mean_depth = depth_moment / final_weight;
 				distortion_per_weight = distortion_image[pix_id] / final_weight;
 			}
 		}
@@ -356,7 +354,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 				// D = S * sum(w*z*z) - sum(w*z)^2, so dD/dw = S*(z-mean)^2 + D/S.
 				const float depth_delta = depth - mean_depth;
 				const float distortion_weight_grad = final_weight * depth_delta * depth_delta + distortion_per_weight;
-				dL_ddepth += dL_ddistortion_pixel * contrib * 2.0f * (final_weight * depth - depth_moment);
+				dL_ddepth += dL_ddistortion_pixel * contrib * 2.0f * final_weight * depth_delta;
 				dL_dcontrib += dL_ddistortion_pixel * (distortion_weight_grad - accum_distortion_grad);
 				accum_distortion_grad = alpha * distortion_weight_grad + (1.0f - alpha) * accum_distortion_grad;
 			}
@@ -478,7 +476,6 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	float rest_distortion_grad = 0; // of sum(w * dD/dw) = 2 * D
 
 	float final_weight = 0;
-	float depth_moment = 0; // Final weighted depth for this pixel (without background)
 	float mean_depth = 0;
 	float distortion_per_weight = 0;
 
@@ -498,13 +495,12 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		rest_depth = final_depths[pix_id];
 		const float2 moments = distortion_moments[pix_id];
 		final_weight = moments.x;
-		depth_moment = moments.y;
+		mean_depth = moments.y;
 		rest_normal = make_float3(final_normals[pix_id], final_normals[W * H + pix_id], final_normals[2 * W * H + pix_id]);
 		const float final_distort = final_distorts[pix_id];
 		rest_distortion_grad = 2.0f * final_distort;
 		if (final_weight > 0.0f)
 		{
-			mean_depth = depth_moment / final_weight;
 			distortion_per_weight = final_distort / final_weight;
 		}
 		dL_dnormal_pixel = make_float3(dL_dout_normal[pix_id], dL_dout_normal[W * H + pix_id], dL_dout_normal[2 * W * H + pix_id]);
@@ -589,7 +585,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			dL_ddepth += dL_ddepth_pixel * contrib;
 			dL_dcontrib += dL_ddepth_pixel * (depth - accum_depth_back);
 
-			dL_ddepth += dL_ddistortion_pixel * contrib * 2.0f * (final_weight * depth - depth_moment);
+			dL_ddepth += dL_ddistortion_pixel * contrib * 2.0f * final_weight * depth_delta;
 			dL_dcontrib += dL_ddistortion_pixel * (distortion_weight_grad - accum_distortion_grad_back);
 		}
 

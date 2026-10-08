@@ -45,7 +45,7 @@ rasterizeTrianglesForward(
 	const bool use_vertex_color = use_shs ? shs.ndimension() == 4 : feature.ndimension() == 3;
 	const int C = use_shs ? 3 : (use_vertex_color ? feature.size(2) : feature.size(1));
 	int M = 0;
-	if (shs.size(0) != 0)
+	if (shs.ndimension() == 3 || shs.ndimension() == 4)
 	{
 		M = use_vertex_color ? shs.size(2) : shs.size(1);
 	}
@@ -109,8 +109,9 @@ rasterizeTrianglesForward(
 	auto float_opts = vertex.options().dtype(torch::kFloat32);
 	auto byte_opts = vertex.options().dtype(torch::kByte);
 
-	torch::Tensor out_feature = torch::zeros({C, H, W}, float_opts);
-	torch::Tensor radii = torch::zeros({P}, int_opts);
+	// For nonempty scenes the kernels initialize every output element.
+	torch::Tensor out_feature = torch::empty({C, H, W}, float_opts);
+	torch::Tensor radii = torch::empty({P}, int_opts);
 
 	torch::Tensor depth = torch::empty({0}, float_opts);
 	torch::Tensor normal = torch::empty({0}, float_opts);
@@ -121,13 +122,13 @@ rasterizeTrianglesForward(
 	torch::Tensor final_Ts = torch::empty({0}, float_opts);
 	if (rich_info)
 	{
-		depth = torch::full({H, W}, 0.0, float_opts);
-		normal = torch::full({3, H, W}, 0.0, float_opts);
-		distortion = torch::full({H, W}, 0.0, float_opts);
+		depth = torch::empty({H, W}, float_opts);
+		normal = torch::empty({3, H, W}, float_opts);
+		distortion = torch::empty({H, W}, float_opts);
 		contrib_sum = torch::full({P}, 0.0, float_opts);
 		contrib_max = torch::full({P}, 0.0, float_opts);
-		n_contribs = torch::full({H, W}, 0, int_opts);
-		final_Ts = torch::full({H, W}, 0.0, float_opts);
+		n_contribs = torch::empty({H, W}, int_opts);
+		final_Ts = torch::empty({H, W}, float_opts);
 	}
 
 	Params::ForwardOutput forwardOutput = {
@@ -162,6 +163,9 @@ rasterizeTrianglesForward(
 		if (rich_info)
 		{
 			depth.fill_(background_depth);
+			normal.zero_();
+			distortion.zero_();
+			n_contribs.zero_();
 			final_Ts.fill_(1.0f);
 		}
 	}
@@ -222,7 +226,7 @@ rasterizeTrianglesBackward(
 	const bool use_vertex_color = use_shs ? shs.ndimension() == 4 : feature.ndimension() == 3;
 	const int C = use_shs ? 3 : (use_vertex_color ? feature.size(2) : feature.size(1));
 	int M = 0;
-	if (shs.size(0) != 0)
+	if (shs.ndimension() == 3 || shs.ndimension() == 4)
 	{
 		M = use_vertex_color ? shs.size(2) : shs.size(1);
 	}

@@ -239,8 +239,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	float3 accum_normal = {0, 0, 0};
 	float accum_depth = 0.0f;
 	float accum_weight = 0.0f;
-	float accum_depth_squared = 0.0f;
-	float accum_distort = 0.0f;
+	float mean_depth = 0.0f;
+	float depth_variance = 0.0f;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -293,10 +293,17 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 
 				const float depth = s.depth;
 				accum_normal += collected_normal_view[j] * sqrt(s.inv_n_dot_n) * contrib;
-				accum_distort += (depth * depth * accum_weight + accum_depth_squared - 2.0f * depth * accum_depth) * contrib;
-				accum_weight += contrib;
+				// Weighted Welford: D = sum(i<j) w_i*w_j*(z_i-z_j)^2 = W*M2.
+				const float next_weight = accum_weight + contrib;
+				if (next_weight > 0.0f)
+				{
+					const float delta = depth - mean_depth;
+					const float relative_weight = contrib / next_weight;
+					depth_variance += accum_weight * relative_weight * delta * delta;
+					mean_depth += relative_weight * delta;
+				}
+				accum_weight = next_weight;
 				accum_depth += depth * contrib;
-				accum_depth_squared += depth * depth * contrib;
 			}
 
 			T *= (1.0f - alpha);
@@ -316,9 +323,9 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 
 		if (rich_info)
 		{
-			// Preserve raw moments before background addition or 1-T cancellation.
-			distortion_moments[pix_id] = make_float2(accum_weight, accum_depth);
-			out_distort[pix_id] = accum_distort;
+			// Save the foreground weight and mean; the background is not part of D.
+			distortion_moments[pix_id] = make_float2(accum_weight, mean_depth);
+			out_distort[pix_id] = accum_weight * depth_variance;
 			out_depth[pix_id] = accum_depth + T * background_depth;
 			out_normal[pix_id] = accum_normal.x;
 			out_normal[H * W + pix_id] = accum_normal.y;
@@ -374,8 +381,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	float3 accum_normal = {0, 0, 0};
 	float accum_depth = 0.0f;
 	float accum_weight = 0.0f;
-	float accum_depth_squared = 0.0f;
-	float accum_distort = 0.0f;
+	float mean_depth = 0.0f;
+	float depth_variance = 0.0f;
 	uint32_t n_contrib = 0;
 
 	// Blends the nearest pending hit, recomputing its sample rather than keeping it in the window.
@@ -405,10 +412,16 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			atomicMaxFloat(&contrib_max[global_id], contrib);
 
 			accum_normal += normal_view * sqrt(s.inv_n_dot_n) * contrib;
-			accum_distort += (depth * depth * accum_weight + accum_depth_squared - 2.0f * depth * accum_depth) * contrib;
-			accum_weight += contrib;
+			const float next_weight = accum_weight + contrib;
+			if (next_weight > 0.0f)
+			{
+				const float delta = depth - mean_depth;
+				const float relative_weight = contrib / next_weight;
+				depth_variance += accum_weight * relative_weight * delta * delta;
+				mean_depth += relative_weight * delta;
+			}
+			accum_weight = next_weight;
 			accum_depth += depth * contrib;
-			accum_depth_squared += depth * depth * contrib;
 		}
 
 		T *= (1.0f - alpha);
@@ -466,9 +479,9 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 
 		if (rich_info)
 		{
-			// Preserve raw moments before background addition or 1-T cancellation.
-			distortion_moments[pix_id] = make_float2(accum_weight, accum_depth);
-			out_distort[pix_id] = accum_distort;
+			// Save the foreground weight and mean; the background is not part of D.
+			distortion_moments[pix_id] = make_float2(accum_weight, mean_depth);
+			out_distort[pix_id] = accum_weight * depth_variance;
 			out_depth[pix_id] = accum_depth + T * background_depth;
 			out_normal[pix_id] = accum_normal.x;
 			out_normal[H * W + pix_id] = accum_normal.y;

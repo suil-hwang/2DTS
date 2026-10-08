@@ -35,6 +35,7 @@ class AnimatedTriangle:
         self._animations: list[dict] = []
         self._textures: list[dict] = []
         self._materials: list[dict] = []
+        self._default_material_index = 0
         self._texture_atlas: np.ndarray | None = None
         self._rest_triangle: RawTriangle | None = None
 
@@ -149,6 +150,8 @@ class AnimatedTriangle:
         pending = self._scene_roots.copy()
         while pending:
             node_idx = pending.pop()
+            if node_idx in self._scene_nodes:
+                raise ValueError("glTF scene nodes must form an acyclic tree")
             self._scene_nodes.add(node_idx)
             pending.extend(self._nodes[node_idx]["children"])
         self._textures = self._parse_textures(glb_path)
@@ -317,7 +320,10 @@ class AnimatedTriangle:
                 }
             )
 
-        if not materials:
+        self._default_material_index = len(materials)
+        if not materials or any("material" not in primitive
+                                for mesh in self._gltf.get("meshes", [])
+                                for primitive in mesh.get("primitives", [])):
             materials.append(
                 {
                     "base_color_factor": np.asarray([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
@@ -420,7 +426,7 @@ class AnimatedTriangle:
                         "vertex_rgba": vertex_rgba,
                         "joints": joints,
                         "weights": weights,
-                        "material": primitive_def.get("material", 0),
+                        "material": primitive_def.get("material", self._default_material_index),
                         "morph_positions": morph_positions,
                     }
                 )
@@ -584,13 +590,19 @@ class AnimatedTriangle:
             rgba *= primitive["vertex_rgba"]
 
         material = self._materials[primitive["material"]] if primitive["material"] < len(self._materials) else self._materials[0]
-        uv = self._get_material_uv(primitive)
-        if material["resolved_texture"] is not None and uv is not None:
-            rgba *= self._sample_texture({"image": material["resolved_texture"], "wrap_s": material["wrap_s"], "wrap_t": material["wrap_t"]}, uv)
-            return np.clip(rgba, 0.0, 1.0)
-
         rgba *= material["base_color_factor"]
-        rgba[:, :3] = np.clip(rgba[:, :3] + material["emissive_factor"] * material["emissive_strength"], 0.0, 1.0)
+        base_texture = material["base_color_texture"]
+        if base_texture is not None:
+            uv = primitive["texcoords"].get(base_texture.get("texCoord", 0))
+            if uv is not None:
+                rgba *= self._sample_texture(self._textures[base_texture["index"]], uv)
+        emissive = np.broadcast_to(material["emissive_factor"] * material["emissive_strength"], (len(positions), 3)).copy()
+        emissive_texture = material["emissive_texture"]
+        if emissive_texture is not None:
+            uv = primitive["texcoords"].get(emissive_texture.get("texCoord", 0))
+            if uv is not None:
+                emissive *= self._sample_texture(self._textures[emissive_texture["index"]], uv)[:, :3]
+        rgba[:, :3] = np.clip(rgba[:, :3] + emissive, 0.0, 1.0)
 
         if material["alpha_mode"] == "OPAQUE":
             rgba[:, 3] = 1.0
@@ -613,6 +625,11 @@ class AnimatedTriangle:
                     return False
                 if material["uv_set"] is not None and material["uv_set"] not in primitive["texcoords"]:
                     return False
+                uv = self._get_material_uv(primitive)
+                if np.any((uv < 0) | (uv > 1)):
+                    # Clamping or wrapping vertices before interpolation changes
+                    # fragment UVs; the atlas cannot implement either operation.
+                    return False
         return True
 
     def _get_material_uv(self, primitive: dict) -> np.ndarray | None:
@@ -628,8 +645,8 @@ class AnimatedTriangle:
         if uv is None:
             raise ValueError("Texture sampling requested for primitive without UV coordinates")
         uv = uv.copy().astype(np.float32)
-        uv[:, 0] = self._wrap_uv(uv[:, 0], material["wrap_s"])
-        uv[:, 1] = self._wrap_uv(uv[:, 1], material["wrap_t"])
+        # Preserve 0/1 endpoints: wrapping vertices first collapses a full texture span.
+        uv = np.clip(uv, 0.0, 1.0)
         transform = material["atlas_transform"]
         remapped = uv
         remapped[..., 0] = transform[2] + remapped[..., 0] * transform[0]
@@ -667,7 +684,7 @@ class AnimatedTriangle:
                     return idx
             raise ValueError(f"Animation not found: {animation_index}")
         if animation_index is None:
-            return self.active_animation_index
+            animation_index = self.active_animation_index
         if animation_index < 0 or animation_index >= len(self._animations):
             raise IndexError(f"Animation index out of range: {animation_index}")
         return animation_index
@@ -756,6 +773,8 @@ class AnimatedTriangle:
                     faces.append(tri)
             return np.asarray(faces, dtype=np.int32).reshape(-1, 3)
         if mode == 6:
+            if len(indices) < 3:
+                return np.empty((0, 3), dtype=np.int32)
             root = int(indices[0])
             faces = [[root, int(indices[idx]), int(indices[idx + 1])] for idx in range(1, len(indices) - 1)]
             return np.asarray(faces, dtype=np.int32).reshape(-1, 3)

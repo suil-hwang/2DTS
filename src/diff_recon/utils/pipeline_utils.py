@@ -1,5 +1,5 @@
-import os
 import multiprocessing
+import time
 from typing import Callable, List, Tuple, Any
 
 
@@ -27,9 +27,12 @@ def run_exp(func_list: List[Callable], num_workers: int = 1, multi_process: bool
                 p.start()
                 processes.append(p)
                 if delay > 0:
-                    os.system(f"sleep {delay}")  # stagger each process
+                    time.sleep(delay)
             for p in processes:
                 p.join()
+            failed = [(p.pid, p.exitcode) for p in processes if p.exitcode != 0]
+            if failed:
+                raise RuntimeError(f"Experiment processes failed (pid, exitcode): {failed}")
 
 
 def run_exp_with_args(
@@ -58,7 +61,10 @@ def run_exp_with_args(
                 p.start()
                 processes.append(p)
                 if delay > 0:
-                    os.system(f"sleep {delay}")  # stagger each process
+                    time.sleep(delay)
 
             for p in processes:
                 p.join()
+            failed = [(p.pid, p.exitcode) for p in processes if p.exitcode != 0]
+            if failed:
+                raise RuntimeError(f"Experiment processes failed (pid, exitcode): {failed}")

@@ -1,5 +1,6 @@
 from .Colmap_dataset import ColmapDatasetFactory
-from .colmap_loader import CameraInfo, readColmapCameras
+from .colmap_loader import CameraInfo
+from .dataset_utils import read_validated_colmap_cameras
 
 
 class MatrixCityDatasetFactory(ColmapDatasetFactory):
@@ -26,7 +27,7 @@ class MatrixCityDatasetFactory(ColmapDatasetFactory):
             else:
                 raise FileNotFoundError(f"Cannot find {cameras_txt_path}")
 
-            cam_infos = readColmapCameras(images_path, cameras_path, images_folder)
+            cam_infos = read_validated_colmap_cameras(images_path, cameras_path, images_folder)
             cam_infos = sorted(cam_infos, key=lambda x: x.image_name)
             cam_infos_all.append(cam_infos)
         return tuple(cam_infos_all)

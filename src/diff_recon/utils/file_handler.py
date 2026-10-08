@@ -62,11 +62,12 @@ class OSSHandler:
     def upload_key(self):
         """Context manager for temporarily unlocking uploads."""
         self._logger.info(f"Temporarily unlocking upload for {self._oss_root}")
+        previous_lock = self._upload_lock
         try:
             self._upload_lock = False
             yield
         finally:
-            self._upload_lock = True
+            self._upload_lock = previous_lock
 
     def getFilePath(self, file_path: str, skip_exist: bool = None, is_dir: bool = False, requires: bool = True) -> str:
         if not self.getFile(file_path, skip_exist, is_dir) and requires:
@@ -171,7 +172,7 @@ class OSSHandler:
         :param src_file_path: file path relative to the local root of this handler
         :param dst_file_path: file path relative to the local root of this handler
         """
-        self.localPutFile(self.getLocalPath(src_file_path), dst_file_path, skip_exist)
+        return self.localPutFile(self.getLocalPath(src_file_path), dst_file_path, skip_exist)
 
     def remoteCopyFile(self, src_file_path: str, dst_file_path: str, skip_exist: bool = None, is_dir: bool = False) -> bool:
         """

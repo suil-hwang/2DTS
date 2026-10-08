@@ -47,6 +47,9 @@ class RawTriangle:
         print(f"Number of points: {len(self)}")
         print(f"Number of SHs: {self.shs.shape[-1] // 3 if self.shs is not None and self.shs.size > 0 else 0}")
         print(f"Has texture: {self.hasTexture()}")
+        if len(self) == 0:
+            print("=" * len(banner))
+            return
         print(f"x range: {self.vertex[..., 0].min():>8.1f} - {self.vertex[..., 0].max():>8.1f}")
         print(f"y range: {self.vertex[..., 1].min():>8.1f} - {self.vertex[..., 1].max():>8.1f}")
         print(f"z range: {self.vertex[..., 2].min():>8.1f} - {self.vertex[..., 2].max():>8.1f}")
@@ -83,10 +86,10 @@ class RawTriangle:
             return self
 
         if len(self) == 0:
-            self.vertex = other.vertex
-            self.opacity = other.opacity
-            self.shs = other.shs
-            self.uv = other.uv
+            self.vertex = other.vertex.copy()
+            self.opacity = other.opacity.copy() if other.opacity is not None else None
+            self.shs = other.shs.copy() if other.shs is not None else None
+            self.uv = other.uv.copy() if other.uv is not None else None
             self.texture = other.texture.copy() if other.texture is not None else None
             self.contained_idx = other.contained_idx.copy() if other.contained_idx is not None else None
             return self
@@ -94,9 +97,14 @@ class RawTriangle:
         self_has_texture = self.hasTexture()
         other_has_texture = other.hasTexture()
 
+        for name in ("opacity", "shs"):
+            left, right = getattr(self, name), getattr(other, name)
+            if (left is None) != (right is None) or (left is not None and left.shape[1:] != right.shape[1:]):
+                raise ValueError(f"Cannot concatenate triangles with incompatible {name}")
+
         self.vertex = np.concatenate((self.vertex, other.vertex))
-        self.opacity = np.concatenate((self.opacity, other.opacity)) if self.opacity is not None else other.opacity
-        self.shs = np.concatenate((self.shs, other.shs)) if self.shs is not None else other.shs
+        self.opacity = np.concatenate((self.opacity, other.opacity)) if self.opacity is not None else None
+        self.shs = np.concatenate((self.shs, other.shs)) if self.shs is not None else None
 
         if self_has_texture and other_has_texture:
             atlas, transforms = build_texture_atlas([self.texture, other.texture])
@@ -139,8 +147,8 @@ class RawTriangle:
         removed_triangle = self[~self.contained_idx]
         self.vertex, self.opacity, self.shs, self.uv = (
             self.vertex[self.contained_idx],
-            self.opacity[self.contained_idx],
-            self.shs[self.contained_idx],
+            self.opacity[self.contained_idx] if self.opacity is not None else None,
+            self.shs[self.contained_idx] if self.shs is not None else None,
             self.uv[self.contained_idx] if self.uv is not None else None,
         )
         self.resetContainedIdx()
@@ -151,6 +159,11 @@ class RawTriangle:
         if len(indices) != len(other):
             raise ValueError(f"Expected {len(indices)} replacement triangles, got {len(other)}")
 
+        for name in ("opacity", "shs"):
+            left, right = getattr(self, name), getattr(other, name)
+            if (left is None) != (right is None) or (left is not None and left.shape[1:] != right.shape[1:]):
+                raise ValueError(f"Cannot replace triangles with incompatible {name}")
+
         if self.uv is not None or other.uv is not None:
             if self.uv is None or other.uv is None:
                 raise ValueError("Cannot replace textured triangles with non-textured triangles or vice versa")
@@ -158,23 +171,20 @@ class RawTriangle:
                 raise ValueError("Replace only supports textured triangles sharing the same texture atlas")
 
         self.vertex[indices] = other.vertex
-        self.opacity[indices] = other.opacity
-        self.shs[indices] = other.shs
+        if self.opacity is not None:
+            self.opacity[indices] = other.opacity
+        if self.shs is not None:
+            self.shs[indices] = other.shs
         if self.uv is not None:
             self.uv[indices] = other.uv
 
     def loadPLY(self, path):
         if not os.path.exists(path):
-            print(f"[Warning] File {path} does not exist! From loadPLY function in RawTriangle class.")
-            return
+            raise FileNotFoundError(path)
 
         self.ply_path = path
 
-        try:
-            plydata = PlyData.read(path)
-        except Exception as e:
-            print(f"Error reading {path}: {e}")
-            return
+        plydata = PlyData.read(path)
 
         element = plydata.elements[0]
         element_keys = [p.name for p in element.properties]
@@ -211,6 +221,12 @@ class RawTriangle:
     def savePLY(self, path, save_empty=False, save_extra=False):
         if not save_empty and len(self) == 0:
             return
+
+        if len(self) == 0 and self.shs is None:
+            return RawTriangle(np.empty((0, 3, 3)), np.empty((0, 1)), np.empty((0, 3))).savePLY(
+                path, save_empty=True, save_extra=save_extra)
+        if self.opacity is None or self.shs is None:
+            raise ValueError("PLY export requires opacity and SH attributes")
 
         Path(path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -325,7 +341,7 @@ class RawTriangle:
             texture = texture[..., :3] if np.allclose(texture[..., 3], 1.0) else texture
         elif mesh.visual.kind == "vertex":
             rgba = np.asarray(mesh.visual.vertex_colors[mesh.faces], dtype=np.float32) / 255.0
-            opacity = rgba[:, 0, 3:]
+            opacity = rgba[..., 3].mean(axis=1, keepdims=True)
         else:
             rgba = np.asarray(mesh.visual.face_colors, dtype=np.float32)[: len(vertices)] / 255.0
             opacity = rgba[:, 3:]

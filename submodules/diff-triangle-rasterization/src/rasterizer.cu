@@ -473,7 +473,7 @@ void Rasterizer::forward(
 		num_rendered, 0, 32 + bit, stream);
 	CHECK_CUDA(debug);
 
-	Params::ImageState imageState(forwardOutput.imageBuffer, (size_t)(W * H), true);
+	Params::ImageState imageState(forwardOutput.imageBuffer, (size_t)(W * H), (size_t)(grid.x * grid.y + 1), true);
 
 	cudaMemsetAsync(imageState.ranges, 0, (grid.x * grid.y + 1) * sizeof(uint2), stream);
 	CHECK_CUDA(debug);
@@ -582,7 +582,7 @@ void Rasterizer::backward(
 
 	Params::GeometryState geometryState(backwardInput.geometryBuffer, (size_t)P, false, geometryInfo.use_vertex_color);
 	Params::BinningState binningState(backwardInput.binningBuffer, (size_t)backwardInput.num_rendered);
-	Params::ImageState imageState(backwardInput.imageBuffer, (size_t)(W * H));
+	Params::ImageState imageState(backwardInput.imageBuffer, (size_t)(W * H), (size_t)(grid.x * grid.y + 1));
 
 	auto float_opts = backwardInput.geometryBuffer.options().dtype(torch::kFloat32);
 	// float4-padded so each pixel adds a vertex gradient with one vector atomic.

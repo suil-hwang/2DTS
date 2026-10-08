@@ -8,6 +8,8 @@ class Config(Namespace):
         super().__init__(**kwargs)
 
     def __getattr__(self, name: str):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
         try:
             return super().__getattr__(name)
         except AttributeError:
@@ -28,9 +30,11 @@ class Config(Namespace):
 
 def dictToConfig(d):
     if isinstance(d, dict):
-        for k in d.keys():
-            d[k] = dictToConfig(d[k])
-        return Config(**d)
+        return Config(**{k: dictToConfig(v) for k, v in d.items()})
+    elif isinstance(d, list):
+        return [dictToConfig(value) for value in d]
+    elif isinstance(d, tuple):
+        return tuple(dictToConfig(value) for value in d)
     else:
         return d
 
@@ -44,18 +48,26 @@ def configToDict(c, ignore_private=True):
         for k in d.keys():
             d[k] = configToDict(d[k], ignore_private)
         return d
+    elif isinstance(c, list):
+        return [configToDict(value, ignore_private) for value in c]
+    elif isinstance(c, tuple):
+        return tuple(configToDict(value, ignore_private) for value in c)
     else:
         return c
 
 
 def loadConfig(config_path: str) -> Config:
-    with open(config_path) as config_file:
+    config_path = str(config_path)
+    if not config_path.endswith((".json", ".yaml")):
+        raise ValueError(f"Unknown config file type: {config_path}")
+    with open(config_path, encoding="utf-8") as config_file:
         if config_path.endswith(".json"):
             config_dict = json.load(config_file)
         elif config_path.endswith(".yaml"):
             config_dict = yaml.safe_load(config_file)
-        else:
-            raise ValueError(f"Unknown config file type: {config_path}")
+
+    if not isinstance(config_dict, dict):
+        raise ValueError("Config file must contain a mapping")
 
     config = dictToConfig(config_dict)
     config.__setattr__("_config_path", config_path)
@@ -63,12 +75,13 @@ def loadConfig(config_path: str) -> Config:
 
 
 def saveConfig(config: Config, config_path: str):
+    config_path = str(config_path)
+    if not config_path.endswith((".json", ".yaml")):
+        raise ValueError(f"Unknown config file type: {config_path}")
     config_dict = configToDict(config)
 
-    with open(config_path, "w") as config_file:
+    with open(config_path, "w", encoding="utf-8") as config_file:
         if config_path.endswith(".json"):
             json.dump(config_dict, config_file, indent=4)
         elif config_path.endswith(".yaml"):
             yaml.safe_dump(config_dict, config_file, indent=4, sort_keys=False)
-        else:
-            raise ValueError(f"Unknown config file type: {config_path}")

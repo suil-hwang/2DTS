@@ -12,11 +12,14 @@ class NerfSyntheticDatasetFactory(ColmapDatasetFactory):
 
     def _readCamerasFromTransforms(self, transforms_file: str):
         cam_infos = []
-        with open(self._file_handler.getFilePath(transforms_file)) as json_file:
+        with open(self._file_handler.getFilePath(transforms_file), encoding="utf-8") as json_file:
             contents = json.load(json_file)
             FovX = contents["camera_angle_x"]
             frames = contents["frames"]
             for idx, frame in enumerate(frames):
+                image_path = frame["file_path"]
+                if not Path(image_path).suffix:
+                    image_path += ".png"
                 c2w = np.array(frame["transform_matrix"])  # NeRF 'transform_matrix' is a camera-to-world transform
                 c2w[:3, 1:3] *= -1  # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
 
@@ -31,7 +34,7 @@ class NerfSyntheticDatasetFactory(ColmapDatasetFactory):
                         T=T,
                         FovY=None,
                         FovX=FovX,
-                        image_path=frame["file_path"] + ".png",
+                        image_path=image_path,
                         image_name=Path(frame["file_path"]).stem,
                         width=None,
                         height=None,

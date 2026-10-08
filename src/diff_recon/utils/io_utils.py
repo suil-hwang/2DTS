@@ -4,6 +4,7 @@
 import hashlib
 import logging
 import os
+import posixpath
 import re
 import shutil
 import sys
@@ -249,9 +250,12 @@ class OSSIO(DefaultIO):
         self.auth = Auth(access_key_id, access_key_secret)
         if isinstance(buckets, str):
             buckets = [buckets]
+        else:
+            buckets = list(buckets)
         if isinstance(hosts, str):
             hosts = [hosts for i in range(len(buckets))]
         else:
+            hosts = list(hosts)
             assert len(hosts) == len(buckets), "number of hosts and number of buckets should be the same"
 
         # this is used for load evtorch pretrain model
@@ -298,21 +302,25 @@ class OSSIO(DefaultIO):
         if not full_path.startswith("oss://"):
             return super().open(full_path, mode)
 
+        if mode not in ("r", "rb", "w", "wb", "a"):
+            raise ValueError(f"Unsupported OSS file mode: {mode}")
+
         bucket, path = self._split(full_path)
         num_retry = 0
         max_retry = 10
+        last_error = None
         while num_retry < max_retry:
             try:
                 with mute_stderr():
                     path_exists = bucket.object_exists(path)
                 break
             except Exception as e:
+                last_error = e
                 num_retry += 1
                 print(f"object_exists exception occur, sleep 3s to retry num_retry/max_retry {num_retry}/{max_retry}\n {e}")
                 time.sleep(3)
-
-        with mute_stderr():
-            path_exists = bucket.object_exists(path)
+        else:
+            raise OSError(f"Unable to check OSS object after {max_retry} attempts: {full_path}") from last_error
         if "w" in mode:
             if path_exists:
                 bucket.delete_object(path)
@@ -353,9 +361,11 @@ class OSSIO(DefaultIO):
                         assert mode == "r"
                         return NullContextWrapper(StringIO(data.decode()))
                 except Exception as e:
+                    last_error = e
                     num_retry += 1
                     print(f"read exception occur, sleep 3s to retry num_retry/max_retry {num_retry}/{max_retry}\n {e}")
                     time.sleep(3)
+            raise OSError(f"Unable to read OSS object after {max_retry} attempts: {full_path}") from last_error
 
     def exists(self, path):
         if not path.startswith("oss://"):
@@ -397,23 +407,30 @@ class OSSIO(DefaultIO):
         """oss always bug, we need safe_copy!"""
         try_flag = True
         try_idx = 0
+        last_error = None
         while try_flag and try_idx < try_max:
             try_idx += 1
             try:
                 self.copy(src, dst)
                 try_flag = False
-            except:
-                pass
+            except Exception as error:
+                last_error = error
 
         if try_flag:
-            print("oss copy from %s to %s failed!!! TRIGGER safe exit!" % (src, dst))
+            raise OSError(f"OSS copy failed after {try_max} attempts: {src} -> {dst}") from last_error
         return
 
     @staticmethod
     def _atomic_download(bucket, src, dst, **kwargs):
-        tmp = f"{dst}.tmp_{os.getpid()}"
-        bucket.get_object_to_file(src, tmp, **kwargs)
-        os.replace(tmp, dst)
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(prefix=Path(dst).name + ".tmp_", dir=Path(dst).parent, delete=False) as handle:
+            tmp = handle.name
+        try:
+            bucket.get_object_to_file(src, tmp, **kwargs)
+            os.replace(tmp, dst)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
 
     def copy(self, src, dst):
         cloud_src = src.startswith("oss://")
@@ -425,7 +442,7 @@ class OSSIO(DefaultIO):
             return
         # download
         if cloud_src and not cloud_dst:
-            target_dir, _ = os.path.split(dst)
+            target_dir = os.path.dirname(dst) or "."
             if not os.path.exists(target_dir):
                 try:
                     os.makedirs(target_dir)
@@ -463,10 +480,13 @@ class OSSIO(DefaultIO):
         if src_bucket.get_bucket_location().location != bucket.get_bucket_location().location:
             import tempfile
 
-            local_tmp = os.path.join(tempfile.gettempdir(), src)
-            self.copy(f"oss://{src_bucket.bucket_name}/{src}", local_tmp)
-            self.copy(local_tmp, f"oss://{bucket.bucket_name}/{dst}")
-            self.remove(local_tmp)
+            with tempfile.NamedTemporaryFile(prefix="2dts_oss_copy_", delete=False) as handle:
+                local_tmp = handle.name
+            try:
+                self.copy(f"oss://{src_bucket.bucket_name}/{src}", local_tmp)
+                self.copy(local_tmp, f"oss://{bucket.bucket_name}/{dst}")
+            finally:
+                Path(local_tmp).unlink(missing_ok=True)
             return
 
         if total_size < 1024**3 or src_bucket != bucket:  # 1GB
@@ -501,20 +521,21 @@ class OSSIO(DefaultIO):
             return super().copytree(src, dst)
         if cloud_dst:
             src_files = self.listdir(src, recursive=True)
-            max_len = min(max(map(len, src_files)), 50)
+            max_len = min(max(map(len, src_files), default=0), 50)
             with tqdm(src_files, desc="uploading", leave=False) as progress:
                 for file in progress:
                     progress.set_postfix({"file": f"{file:-<{max_len}}"[:max_len]})
-                    self.copy(os.path.join(src, file), os.path.join(dst, file))
+                    src_file = posixpath.join(src, file) if cloud_src else os.path.join(src, file)
+                    self.copy(src_file, posixpath.join(dst, file.replace("\\", "/")))
         else:
             assert cloud_src and not cloud_dst
             self.makedirs(dst)
             created_dir = {dst}
             src_files = self.listdir(src, recursive=True)
-            max_len = min(max(map(len, src_files)), 50)
+            max_len = min(max(map(len, src_files), default=0), 50)
             with tqdm(src_files, desc="downloading", leave=False) as progress:
                 for file in progress:
-                    src_file = os.path.join(src, file)
+                    src_file = posixpath.join(src, file)
                     dst_file = os.path.join(dst, file)
                     dst_dir = os.path.dirname(dst_file)
                     if dst_dir not in created_dir:
@@ -691,7 +712,10 @@ class OSSFile:
         import oss2
 
         try:
-            self.bucket.append_object(self.path, self.position, self.buffer.getvalue())
+            result = self.bucket.append_object(self.path, self.position, self.buffer.getvalue())
+            self.position = result.next_position
+            self.buffer.seek(0)
+            self.buffer.truncate(0)
         except oss2.exceptions.RequestError as e:
             if "timeout" not in str(e) or retry > 2:
                 raise
@@ -701,10 +725,8 @@ class OSSFile:
             import time
 
             time.sleep(5)
-            self.flush(retry + 1)
+            return self.flush(retry + 1)
         except oss2.exceptions.ObjectNotAppendable as e:
-            from .. import io
-
             # print_log(
             #     str(e) + '\nTrying to recover..\n',
             #     logger='root',

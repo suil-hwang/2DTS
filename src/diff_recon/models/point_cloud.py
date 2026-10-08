@@ -6,12 +6,17 @@ from ..utils.sh_utils import SH2RGB
 
 class PointCloud:
     def __init__(self, points: np.array = None, colors: np.array = None, normals: np.array = None):
+        if points is not None:
+            points = np.asarray(points)
+            if points.ndim != 2 or points.shape[1] != 3:
+                raise ValueError("points must have shape (N, 3)")
+            colors = np.zeros_like(points) if colors is None else np.asarray(colors)
+            normals = np.zeros_like(points) if normals is None else np.asarray(normals)
+            if colors.shape != points.shape or normals.shape != points.shape:
+                raise ValueError("colors and normals must have the same (N, 3) shape as points")
         self.points = points
         self.colors = colors
         self.normals = normals
-
-        if points is not None and normals is None:
-            self.normals = np.zeros_like(points)
 
     def fetchPly(self, ply_path):
         """Read point positions, RGB or SH DC colors, and optional normals."""
@@ -41,7 +46,9 @@ class PointCloud:
         Path(ply_path).parent.mkdir(parents=True, exist_ok=True)
 
         xyz = self.points
-        rgb = self.colors * 255
+        if not np.isfinite(self.colors).all():
+            raise ValueError("point colors must be finite")
+        rgb = np.clip(self.colors, 0, 1) * 255
         normals = self.normals
         # Define the dtype for the structured array
         dtype = [("x", "f4"), ("y", "f4"), ("z", "f4"), ("nx", "f4"), ("ny", "f4"), ("nz", "f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")]
